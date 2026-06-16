@@ -76,12 +76,19 @@ def make_demand(cfg: dict, dates: pd.DatetimeIndex,
 
 def analyze_region(cf: np.ndarray, dates: pd.DatetimeIndex, demand: np.ndarray,
                    storage_cfg: dict, steps_per_year: int,
-                   simulate: bool = True) -> RegionResult:
+                   simulate: bool = True, overbuild: float = 1.0) -> RegionResult:
     """Run the full net + loss-adjusted cumulative deficit analysis for one region.
 
     storage_cfg holds up_efficiency, down_efficiency, annual_decay,
     max_iterations, tolerance (the ``storage`` block of the config, or an
     archetype with max_iterations/tolerance merged in).
+
+    ``overbuild`` (>= 1) installs that multiple of the deficit-covering capacity --
+    the co-location scenario's (1+k): the same land carries (1+k)x the optimal-mix
+    capacity, so the surplus shrinks the storage need. It scales ``net_factor`` (the
+    seed of the f_adj loss iteration), which is the only scale the analysis is not
+    invariant to (cf is internally mean-normalized, so multiplying the supply series
+    would have no effect). See colocation_scenario.md.
     """
     dt = 1.0 / steps_per_year
     up = storage_cfg["up_efficiency"]
@@ -97,6 +104,7 @@ def analyze_region(cf: np.ndarray, dates: pd.DatetimeIndex, demand: np.ndarray,
     # --- net analysis (no losses), Deficit.R lines 18-33 -------------------
     annual = pd.Series(cf, index=dates).groupby(dates.year).mean()
     net_factor = annual.mean() / annual.min()
+    net_factor *= overbuild        # co-location (1+k) overbuild; 1.0 = no change
     supply = cf / mean_cf * net_factor
     net_deficit = positive_running_sum((demand - supply) * dt)
     s_net = net_deficit.max()

@@ -41,4 +41,10 @@ fi
 
 python "${REPO}/scripts/usa_eia_feasibility.py"  --config "${CFG}"
 python "${REPO}/scripts/usa_eia_deficit_plots.py" --config "${CFG}"
+
+# co-location feasibility maps (k = 0/17/35/50 %), USA / CONUS, EIA monthly demand
+MONTHLY=/ourdisk/hpc/caps/mchen15/nldas_analysis/results/usa_eia_monthly_demand.csv
+python "${REPO}/scripts/colocation_maps.py" --config "${CFG}" \
+    --summary usa_summary.csv --monthly-csv "${MONTHLY}" --conus
+
 echo "NLDAS USA analysis complete"

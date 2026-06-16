@@ -116,21 +116,27 @@ def _binary_map(ax, gdf, mask, title):
     ax.set_axis_off()
 
 
-def make_figure(gdf: gpd.GeoDataFrame, counts: dict, n: int, out: Path) -> None:
-    fig = plt.figure(figsize=(18, 9.2))
-    gs = fig.add_gridspec(3, 3, height_ratios=[0.16, 1.0, 1.0],
-                          hspace=0.18, wspace=0.04,
-                          left=0.01, right=0.97, top=0.86, bottom=0.02)
+def make_figure(gdf: gpd.GeoDataFrame, counts: dict, n: int, out: Path,
+                dataset: str = "GLDAS", period: str = "2000-2025") -> None:
+    # CONUS spans ~60 deg lon x ~27 deg lat (~2.2:1). With geopandas' equal
+    # aspect, a panel much taller than that leaves big empty vertical bands
+    # (the "too much space" QC flag); too short and the legend collides with
+    # the panel titles. So: size the figure so a 3-col x 2-row block of 2.2:1
+    # maps fills its cells, and keep the legend OUT of the grid -- as a figure
+    # legend in the clear band between the suptitle and the map titles.
+    fig = plt.figure(figsize=(18, 7.6))
+    gs = fig.add_gridspec(2, 3, hspace=0.16, wspace=0.02,
+                          left=0.01, right=0.97, top=0.78, bottom=0.04)
     fig.suptitle("USA solar+wind sustainable regions with electric storage "
-                 "requirements\n(optimal mix, GLDAS 2000-2025, with real power "
-                 "consumption data from EIA)", fontsize=14, weight="bold", y=0.985)
-    axleg = fig.add_subplot(gs[0, :]); axleg.set_axis_off()
-    axleg.legend(handles=[Patch(facecolor=FEASIBLE_C, label="sustainable (≤ threshold)"),
-                          Patch(facecolor=FAIL_C, label="above storage threshold"),
-                          Patch(facecolor=NODATA_C, edgecolor="0.6", label="no data")],
-                 loc="center", ncol=3, fontsize=11, frameon=True,
-                 title="Panels (a)-(c): optimal-mix storage vs. threshold")
-    axmap = [fig.add_subplot(gs[r, c]) for r in (1, 2) for c in (0, 1, 2)]
+                 f"requirements\n(optimal mix, {dataset} {period}, with real power "
+                 "consumption data from EIA)", fontsize=14, weight="bold", y=0.99)
+    fig.legend(handles=[Patch(facecolor=FEASIBLE_C, label="sustainable (≤ threshold)"),
+                        Patch(facecolor=FAIL_C, label="above storage threshold"),
+                        Patch(facecolor=NODATA_C, edgecolor="0.6", label="no data")],
+               loc="center", ncol=3, fontsize=11, frameon=True,
+               bbox_to_anchor=(0.5, 0.875),
+               title="Panels (a)-(c): optimal-mix storage vs. threshold")
+    axmap = [fig.add_subplot(gs[r, c]) for r in (0, 1) for c in (0, 1, 2)]
 
     for k, t in enumerate(THRESHOLDS):
         mask = gdf["_metric"] <= t
@@ -210,7 +216,9 @@ def main() -> None:
     gdf["_metric"] = gdf["mix_s_tot_pct"]
     n = len(summary)
     counts = {t: int((summary["mix_s_tot_pct"] <= t).sum()) for t in THRESHOLDS}
-    make_figure(gdf, counts, n, figdir / "map_usa_feasibility.png")
+    dataset = str(cfg["gldas"]["short_name"]).split("_")[0]   # GLDAS_NOAH025_3H -> GLDAS
+    period = f"{str(cfg['period']['start'])[:4]}-{str(cfg['period']['end'])[:4]}"
+    make_figure(gdf, counts, n, figdir / "map_usa_feasibility.png", dataset, period)
 
 
 if __name__ == "__main__":

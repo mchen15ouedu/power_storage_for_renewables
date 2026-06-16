@@ -19,3 +19,8 @@ results/
 tmp/
 scratch/
 logs/
+
+# secrets / never commit
+hpc/edl_token.txt
+*.edl_token
+.pytest_cache/

@@ -42,15 +42,19 @@ def layout_issues(fig, tol_px: float = 3.0, whitespace_warn: float = 0.80) -> li
     r = fig.canvas.get_renderer()
     from matplotlib.transforms import Bbox
 
+    # specials carry an optional host-axes index so a legend is never flagged
+    # against the axes it lives in. panels use the TIGHT bbox so a panel TITLE
+    # poking up into the legend/suptitle is caught (the data-area extent misses
+    # titles, which was how an earlier legend-over-title overlap slipped through).
     panels, specials = [], []
     if getattr(fig, "_suptitle", None) is not None:
         bb = _bbox(fig._suptitle, r)
         if bb is not None:
-            specials.append(("suptitle", bb))
+            specials.append(("suptitle", bb, None))
     for leg in list(fig.legends):
         bb = _bbox(leg, r)
         if bb is not None:
-            specials.append(("legend", bb))
+            specials.append(("legend", bb, None))
     for i, ax in enumerate(fig.axes):
         if not ax.get_visible():
             continue
@@ -58,14 +62,19 @@ def layout_issues(fig, tol_px: float = 3.0, whitespace_warn: float = 0.80) -> li
         if lg is not None:
             bb = _bbox(lg, r)
             if bb is not None:
-                specials.append((f"axes[{i}].legend", bb))
-        bb = _bbox(ax, r)  # axes window extent (the data area, not tight)
-        if bb is not None:
-            panels.append((f"axes[{i}]", bb))
+                specials.append((f"axes[{i}].legend", bb, i))
+        try:
+            bb = ax.get_tightbbox(r)
+        except Exception:
+            bb = _bbox(ax, r)
+        if bb is not None and bb.width > 0 and bb.height > 0:
+            panels.append((f"axes[{i}]", bb, i))
 
     issues = []
-    for sname, sbb in specials:
-        for pname, pbb in panels:
+    for sname, sbb, shost in specials:
+        for pname, pbb, phost in panels:
+            if shost is not None and shost == phost:
+                continue                       # a legend over its own host axes is fine
             inter = Bbox.intersection(sbb, pbb)
             if inter is not None and inter.width > tol_px and inter.height > tol_px:
                 issues.append(f"OVERLAP {sname} over {pname} "
@@ -73,8 +82,8 @@ def layout_issues(fig, tol_px: float = 3.0, whitespace_warn: float = 0.80) -> li
     # special-vs-special (e.g. legend over suptitle)
     for a in range(len(specials)):
         for b in range(a + 1, len(specials)):
-            na, ba = specials[a]
-            nb, bb = specials[b]
+            na, ba, _ = specials[a]
+            nb, bb, _ = specials[b]
             inter = Bbox.intersection(ba, bb)
             if inter is not None and inter.width > tol_px and inter.height > tol_px:
                 issues.append(f"OVERLAP {na} <-> {nb} "

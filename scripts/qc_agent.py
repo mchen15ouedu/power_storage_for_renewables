@@ -105,13 +105,47 @@ def running_tasks() -> set[int]:
     return yrs
 
 
-def task_jobid(year: int) -> str | None:
-    out = sh(["squeue", "-h", "-u", _user(), "-n", JOBNAME, "-o", "%A %K"])
+def queue_states() -> dict[int, str]:
+    """year -> queue state ('RUNNING' if any task for that year is running, else
+    'PENDING'). A *pending* year (throttled behind the array's %N limit) has no
+    raw files yet and must NEVER be treated as a stalled download -- only running
+    tasks are eligible for stall detection."""
+    out = sh(["squeue", "-h", "-u", _user(), "-n", JOBNAME, "-o", "%K|%T"])
+    st: dict[int, str] = {}
+    for line in out.splitlines():
+        k, _, state = line.partition("|")
+        state = state.strip()
+        for y in _expand_array_indices(k.strip()):
+            if st.get(y) != "RUNNING":      # RUNNING wins over PENDING
+                st[y] = state
+    return st
+
+
+def running_jobids(year: int) -> list[str]:
+    """All currently-RUNNING task ids (`<jobid>_<idx>`) for a given year. Returns
+    every match (there may be more than one if a duplicate slipped through) so the
+    stall handler can kill them ALL before resubmitting."""
+    out = sh(["squeue", "-h", "-u", _user(), "-n", JOBNAME, "-t", "RUNNING", "-o", "%A %K"])
+    ids = []
     for line in out.splitlines():
         a, _, k = line.partition(" ")
-        if k.strip() == str(year):
-            return f"{a}_{year}"
-    return None
+        if year in _expand_array_indices(k.strip()):
+            ids.append(f"{a.strip()}_{year}")
+    return ids
+
+
+def kill_year(year: int, dry: bool = False) -> list[str]:
+    """scancel every running task for `year`; wait briefly so the cancel registers
+    before any resubmit (avoids the stalled job and its replacement coexisting)."""
+    ids = running_jobids(year)
+    for jid in ids:
+        if dry:
+            log.warning("scancel (dry-run) %s", jid)
+        else:
+            sh(["scancel", jid])
+    if ids and not dry:
+        time.sleep(8)        # let SLURM register the cancellation before resubmit
+    return ids
 
 
 def _user() -> str:
@@ -188,17 +222,21 @@ def main() -> None:
 
     while True:
         done = years_done(cfg, years)
-        running = running_tasks()
+        states = queue_states()                 # year -> RUNNING / PENDING
+        queued = set(states)                    # pending OR running = still in the array
+        running_now = {y for y, s in states.items() if s == "RUNNING"}
         up = server_up()
         n_done = sum(done.values())
-        log.info("cycle: %d/%d years complete | running=%s | GES DISC %s",
-                 n_done, len(years), sorted(running), "up" if up else "DOWN")
+        log.info("cycle: %d/%d complete | running=%s | pending=%d | GES DISC %s",
+                 n_done, len(years), sorted(running_now),
+                 len(queued) - len(running_now), "up" if up else "DOWN")
 
         if n_done < len(years) and up:
             for y in years:
                 if done[y]:
                     continue
-                if y not in running:
+                if y not in queued:
+                    # genuinely gone from the queue (its job died) -> resubmit
                     if resubmits[y] < MAX_RESUBMITS:
                         resubmits[y] += 1
                         log.warning("year %d incomplete and not queued -- resubmitting "
@@ -208,19 +246,28 @@ def main() -> None:
                         log.error("year %d still incomplete after %d resubmits -- giving up",
                                   y, MAX_RESUBMITS)
                     continue
-                # running: stall detection on raw-granule growth
+                if y not in running_now:
+                    # PENDING behind the array's %N throttle -- 0 raw files is
+                    # expected, NOT a stall. Leave it alone; reset its stall clock.
+                    last_count[y] = (-1, time.monotonic())
+                    continue
+                # actually RUNNING: stall detection on raw-granule growth
                 cnt = raw_count(cfg, y)
                 prev, since = last_count[y]
                 if cnt != prev:
                     last_count[y] = (cnt, time.monotonic())
-                elif (time.monotonic() - since) > args.stall_min * 60 and cnt >= 0:
+                elif cnt > 0 and (time.monotonic() - since) > args.stall_min * 60:
+                    # only a running task that downloaded SOME files then went
+                    # quiet counts as a real stall (cnt>0 guards against a task
+                    # that just started and hasn't written yet). NASA/GES DISC is
+                    # spotty, so this WILL fire -- always KILL the stalled task
+                    # first, then resubmit a fresh one (never leave both alive).
                     if resubmits[y] < MAX_RESUBMITS:
-                        jid = task_jobid(y)
+                        killed = kill_year(y, args.dry_run)
                         log.warning("year %d STALLED at %d granules for >%dmin -- "
-                                    "cancelling %s and resubmitting", y, cnt,
-                                    args.stall_min, jid)
-                        if jid and not args.dry_run:
-                            sh(["scancel", jid])
+                                    "killed %s, now resubmitting (#%d)", y, cnt,
+                                    args.stall_min, killed or "(none found)",
+                                    resubmits[y] + 1)
                         resubmits[y] += 1
                         resubmit(sbatch, y, args.dry_run)
                         last_count[y] = (-1, time.monotonic())

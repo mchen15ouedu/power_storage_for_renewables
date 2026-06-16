@@ -1,0 +1,73 @@
+# Global renewable energy storage requirement analysis (GLDAS, 3-hourly)
+# Methodology after Fekete, Bacsko, Zhang & Chen (2023), Front. Environ. Sci. 11:1076830
+
+paths:
+  data_dir:    data            # everything below is relative to the repo root unless absolute
+  raw_dir:     data/raw        # 3-hourly GLDAS granules
+  zonal_dir:   data/zonal      # monthly parquet files of 3-hourly zonal means
+  regions_gpkg: data/regions.gpkg
+  regions_csv:  data/regions.csv
+  weights_npz:  data/region_weights.npz
+  results_dir: results
+  figures_dir: figures
+
+period:
+  start: "2000-01-01"          # GLDAS_NOAH025_3H v2.1 spans 2000-01-01 .. near-present
+  end:   "2025-12-31"
+
+gldas:
+  short_name: GLDAS_NOAH025_3H
+  version: "2.1"
+  variables:                   # granule variable -> zonal table column
+    SWdown_f_tavg: swdown      # W m-2, 3-hour backward-averaged
+    Wind_f_inst:   wind10      # m s-1, instantaneous, ~10 m
+    Tair_f_inst:   tair        # K  (demand scenarios, air density)
+    Psurf_f_inst:  psurf       # Pa (air density)
+    Qair_f_inst:   qair        # kg/kg (air density via virtual temperature)
+  download_mode: earthaccess   # earthaccess | local (granules pre-downloaded into raw_dir, e.g. via wget)
+  delete_raw: true             # delete 3-hourly granules once the zonal means are written
+  granules_per_day: 8
+
+regions:
+  admin1_area_km2: 1.5e6       # countries larger than this are split into states/provinces
+  admin1_force: []             # extra adm0_a3 codes to force admin-1 split
+  include_countries: []        # if non-empty, restrict to these adm0_a3 codes (handy for testing)
+  exclude: [ATA]               # adm0_a3 codes to drop
+  nearest_cell_fallback: true  # regions with no grid cell get the nearest land cell
+
+energy:
+  wind:
+    ref_height_m: 10.0         # GLDAS forcing wind reference height
+    hub_height_m: 80.0
+    veg_height_m: 1.5          # H_veg; z_d = 0.7 H_veg, z_0 = 0.1 H_veg (paper Eq. 2-3)
+    start_ms: 3.0              # capacity-factor starting threshold R_s (paper Eq. 1)
+    plateau_ms: 12.0           # capacity-factor plateauing threshold R_p
+    density_correction: true   # u_eq = u_hub (rho/rho0)^(1/3), IEC 61400-12-1; Ulazia et al. 2019
+    rho0: 1.225                # standard air density [kg m-3]
+  solar:
+    start_wm2: 0.0
+    plateau_wm2: 1000.0        # on 3-hourly fluxes; ~standard test insolation. Calibrate vs paper Table 1.
+
+storage:                       # paper Section 2.4 / Eq. 6-9, values from the paper
+  up_efficiency: 0.9           # recharge k_R
+  down_efficiency: 0.8         # discharge k_D
+  annual_decay: 0.7            # annual storage decay k_aS  (per-step k = k_aS ** dt)
+  max_iterations: 20
+  tolerance: 1.0e-3            # convergence on total storage, fraction of annual consumption
+
+demand:
+  profile: flat                # flat | monthly | degree_day
+  monthly_csv: null            # CSV with columns: region_id (or ALL), month (1-12), value
+  balance_temp_k: 291.15       # 18 C balance temperature for degree_day profile
+  base_fraction: 0.6           # fraction of mean demand that is temperature-independent
+
+analysis:
+  mix_step: 0.05               # solar fraction grid for the solar+wind mix sweep
+  dunkelflaute_cf_frac: 0.5    # low-resource spell threshold: cf < frac * mean(cf)
+  gap_window_days: 30          # deepest rolling-window shortfall metric
+  trends: true                 # Mann-Kendall + Sen slope on annual capacity factors
+  pools: true                  # continent + world pooled (interconnected) analysis
+  archetypes:                  # storage technology parameter sets (re-run S_tot per set)
+    - {name: liion,   up_efficiency: 0.95, down_efficiency: 0.95, annual_decay: 0.98}
+    - {name: pumped,  up_efficiency: 0.85, down_efficiency: 0.90, annual_decay: 0.95}
+    - {name: h2,      up_efficiency: 0.60, down_efficiency: 0.50, annual_decay: 1.00}

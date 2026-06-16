@@ -1,0 +1,12 @@
+numpy
+pandas
+xarray
+netCDF4
+scipy
+geopandas>=0.14
+shapely>=2.0
+pyarrow
+matplotlib
+pyyaml
+earthaccess
+dask

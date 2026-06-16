@@ -1,0 +1,86 @@
+# OSCER (OU) configuration -- NLDAS-2 hourly pipeline, USA / CONUS only.
+#   raw hourly granules : /scratch/mchen15/nldas/raw/<YEAR>/   (wget, purged after reduction)
+#   wget URL list       : /scratch/mchen15/nldas/nldas_list.txt (user-provided, GES DISC; CRLF!)
+#   hourly zonal means   : /ourdisk/hpc/caps/mchen15/nldas_full/ (monthly parquet, durable archive)
+#   analysis + figures   : /ourdisk/hpc/caps/mchen15/nldas_analysis/
+#
+# NLDAS_FORA0125_H v2.0: hourly, 0.125 deg, CONUS only (lat 25-53 N, lon -125 to -67 W).
+# No Alaska / Hawaii coverage -- those states are excluded from the USA run.
+# Wind is delivered as eastward/northward components, so wind10 is derived as
+# the speed sqrt(Wind_E^2 + Wind_N^2) in the zonal reduction.
+
+paths:
+  data_dir:    /ourdisk/hpc/caps/mchen15/nldas_analysis/data
+  raw_dir:     /scratch/mchen15/nldas/raw
+  zonal_dir:   /ourdisk/hpc/caps/mchen15/nldas_full
+  regions_gpkg: /ourdisk/hpc/caps/mchen15/nldas_analysis/data/regions.gpkg
+  regions_csv:  /ourdisk/hpc/caps/mchen15/nldas_analysis/data/regions.csv
+  weights_npz:  /ourdisk/hpc/caps/mchen15/nldas_analysis/data/region_weights.npz
+  results_dir: /ourdisk/hpc/caps/mchen15/nldas_analysis/results
+  figures_dir: /ourdisk/hpc/caps/mchen15/nldas_analysis/figures
+
+period:
+  start: "2000-01-01"
+  end:   "2025-12-31"
+
+# Forcing-dataset block (aliased to cfg["gldas"] internally by config.load_config).
+forcing:
+  short_name: NLDAS_FORA0125_H
+  version: "2.0"
+  file_ext: nc                 # NLDAS v2.0 granules are .nc (GLDAS were .nc4)
+  steps_per_year: 8760         # hourly (365 * 24); GLDAS 3-hourly was 2920
+  granules_per_day: 24
+  land_mask_var: Tair          # finite over all CONUS land cells
+  variables:                   # direct granule var -> output column
+    SWdown: swdown
+    Tair:   tair
+    PSurf:  psurf
+    Qair:   qair
+  wind_components: [Wind_E, Wind_N]   # -> wind10 = sqrt(E^2 + N^2)
+  download_mode: local         # granules fetched by wget in the sbatch script
+  delete_raw: false            # the sbatch script removes each year's raw folder itself
+
+regions:
+  admin1_area_km2: 1.5e6
+  admin1_force: [USA]          # always split the USA into states
+  include_countries: [USA]     # NLDAS is CONUS-only -> build USA states only
+  exclude: []
+  nearest_cell_fallback: true  # lets small regions (DC) grab their nearest cell
+  nearest_cell_max_deg: 0.5    # but NOT Alaska/Hawaii -- they sit far off the CONUS grid
+
+energy:
+  wind:
+    ref_height_m: 10.0
+    hub_height_m: 80.0
+    veg_height_m: 1.5
+    start_ms: 3.0
+    plateau_ms: 12.0
+    density_correction: true
+    rho0: 1.225
+  solar:
+    start_wm2: 0.0
+    plateau_wm2: 1000.0
+
+storage:
+  up_efficiency: 0.9
+  down_efficiency: 0.8
+  annual_decay: 0.7
+  max_iterations: 20
+  tolerance: 1.0e-3
+
+demand:
+  profile: flat
+  monthly_csv: null
+  balance_temp_k: 291.15
+  base_fraction: 0.6
+
+analysis:
+  mix_step: 0.05
+  dunkelflaute_cf_frac: 0.5
+  gap_window_days: 30
+  trends: true
+  pools: false                 # single country -> no continent/world pools
+  archetypes:
+    - {name: liion,   up_efficiency: 0.95, down_efficiency: 0.95, annual_decay: 0.98}
+    - {name: pumped,  up_efficiency: 0.85, down_efficiency: 0.90, annual_decay: 0.95}
+    - {name: h2,      up_efficiency: 0.60, down_efficiency: 0.50, annual_decay: 1.00}

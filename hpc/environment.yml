@@ -1,0 +1,20 @@
+# conda/mamba environment for the GLDAS storage pipeline on HPC
+#   mamba env create -f hpc/environment.yml
+#   conda activate gldas
+name: gldas
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - xarray
+  - netcdf4
+  - scipy
+  - geopandas>=0.14
+  - shapely>=2.0
+  - pyarrow
+  - matplotlib
+  - pyyaml
+  - dask
+  - earthaccess

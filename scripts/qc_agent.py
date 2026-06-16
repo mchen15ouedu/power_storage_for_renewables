@@ -1,0 +1,258 @@
+"""QCagent -- babysits the NLDAS run.
+
+Two jobs, run in one long-lived loop (submit it as its own SLURM job):
+
+1. DOWNLOAD / REDUCTION WATCH
+   For each year 2000-2025 it knows the "done" condition is 12 monthly parquet
+   files in zonal_dir. Every cycle it:
+     * checks GES DISC reachability (if the server is down it waits -- no point
+       thrashing resubmits during an outage);
+     * resubmits any year that is incomplete and has NO running/pending array
+       task (its job died -- e.g. a wget disruption aborted it), up to a cap;
+     * detects a STALL: a year whose array task is running but whose raw-granule
+       count has not grown for `stall_min` minutes -> cancels that task and
+       resubmits it (a hung/disrupted download), up to the same cap.
+
+2. FIGURE QC
+   Once every year is complete and the downstream figures exist, it runs the
+   layout checks in ``gldas_storage.qc`` (legend/title overlaps, excess white
+   space) on the feasibility PNG and writes a consolidated qc_report.txt, then
+   exits 0. Exits non-zero if it hits the wall-clock cap with work outstanding.
+
+Usage:
+   python scripts/qc_agent.py --config hpc/config_nldas.yaml \
+       --sbatch hpc/oscer_nldas_zonal.sbatch [--interval 600] [--once]
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from gldas_storage import qc
+from gldas_storage.config import load_config
+
+log = logging.getLogger("qcagent")
+
+GESDISC_PROBE = ("https://data.gesdisc.earthdata.nasa.gov/data/NLDAS/"
+                 "NLDAS_FORA0125_H.2.0/2000/001/")
+JOBNAME = "nldas_zonal"
+MAX_RESUBMITS = 5          # per year, safety cap against runaway resubmission
+REPO = Path(__file__).resolve().parents[1]
+
+
+def sh(cmd: list[str]) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=120).stdout
+    except Exception as exc:                                   # pragma: no cover
+        log.warning("command failed %s: %s", " ".join(cmd), exc)
+        return ""
+
+
+def server_up() -> bool:
+    out = sh(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+              "--max-time", "30", "-I", GESDISC_PROBE])
+    return out.strip() in ("200", "301", "302", "401", "403")  # reachable (auth codes still mean "up")
+
+
+def years_done(cfg: dict, years: range) -> dict[int, bool]:
+    zdir = cfg["paths"]["zonal_dir"]
+    done = {}
+    for y in years:
+        n = len(list(zdir.glob(f"zonal_{y}*.parquet")))
+        done[y] = n >= 12
+    return done
+
+
+def _expand_array_indices(field: str) -> set[int]:
+    """Expand a squeue %K array-index field into the set of year indices.
+
+    SLURM compresses a throttled/pending array into ranges, e.g. "2006-2025%4",
+    and lists multiple chunks comma-separated, e.g. "2006,2008-2010". Missing
+    any of these would make the QCagent resubmit years that are actually queued.
+    """
+    field = field.split("%")[0]            # drop the %<throttle> suffix
+    yrs: set[int] = set()
+    for chunk in field.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            a, _, b = chunk.partition("-")
+            try:
+                yrs.update(range(int(a), int(b) + 1))
+            except ValueError:
+                pass
+        else:
+            try:
+                yrs.add(int(chunk))
+            except ValueError:
+                pass
+    return yrs
+
+
+def running_tasks() -> set[int]:
+    """Year indices of nldas_zonal array tasks currently in the queue (any state)."""
+    out = sh(["squeue", "-h", "-u", _user(), "-n", JOBNAME, "-o", "%K"])
+    yrs: set[int] = set()
+    for line in out.splitlines():
+        yrs |= _expand_array_indices(line.strip())
+    return yrs
+
+
+def task_jobid(year: int) -> str | None:
+    out = sh(["squeue", "-h", "-u", _user(), "-n", JOBNAME, "-o", "%A %K"])
+    for line in out.splitlines():
+        a, _, k = line.partition(" ")
+        if k.strip() == str(year):
+            return f"{a}_{year}"
+    return None
+
+
+def _user() -> str:
+    import getpass
+    return getpass.getuser()
+
+
+def raw_count(cfg: dict, year: int) -> int:
+    raw = Path(cfg["paths"]["raw_dir"]) / str(year)
+    return sum(1 for _ in raw.glob("*.nc")) if raw.exists() else 0
+
+
+def resubmit(sbatch: Path, year: int, dry: bool = False) -> None:
+    if dry:
+        log.warning("RESUBMIT (dry-run) year %d: sbatch --array=%d %s", year, year, sbatch)
+        return
+    out = sh(["sbatch", "--parsable", f"--array={year}", str(sbatch)])
+    log.warning("RESUBMIT year %d -> job %s", year, out.strip() or "?")
+
+
+def usa_job_active() -> bool:
+    return bool(sh(["squeue", "-h", "-u", _user(), "-n", "nldas_usa", "-o", "%A"]).strip())
+
+
+def submit_downstream(usa_sbatch: Path, dry: bool = False) -> None:
+    if dry:
+        log.warning("DOWNSTREAM (dry-run): sbatch %s", usa_sbatch)
+        return
+    out = sh(["sbatch", "--parsable", str(usa_sbatch)])
+    log.warning("submitted downstream USA analysis -> job %s", out.strip() or "?")
+
+
+def figure_qc(cfg: dict) -> list[str]:
+    figdir = cfg["paths"]["figures_dir"]
+    png = figdir / "map_usa_feasibility.png"
+    issues = []
+    if png.exists():
+        issues += qc.raster_issues(png)
+        log.info("QC %s: %s", png.name, "OK" if not issues else f"{len(issues)} issue(s)")
+    else:
+        issues.append(f"missing figure {png}")
+    return issues
+
+
+def write_report(cfg: dict, lines: list[str]) -> None:
+    out = cfg["paths"]["results_dir"] / "qc_report.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines) + "\n")
+    log.info("wrote %s", out)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=REPO / "hpc" / "config_nldas.yaml")
+    ap.add_argument("--sbatch", default=REPO / "hpc" / "oscer_nldas_zonal.sbatch")
+    ap.add_argument("--usa-sbatch", default=REPO / "hpc" / "oscer_nldas_usa.sbatch",
+                    help="downstream USA analysis, auto-submitted once all years are reduced")
+    ap.add_argument("--interval", type=int, default=600, help="seconds between cycles")
+    ap.add_argument("--stall-min", type=int, default=90,
+                    help="minutes of no new granules before a running task is deemed stalled")
+    ap.add_argument("--max-hours", type=float, default=120.0, help="overall wall-clock cap")
+    ap.add_argument("--once", action="store_true", help="run a single cycle and exit")
+    ap.add_argument("--dry-run", action="store_true", help="log resubmit/cancel actions but do not execute them")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+
+    cfg = load_config(args.config)
+    sbatch = Path(args.sbatch)
+    years = range(int(cfg["period"]["start"][:4]), int(cfg["period"]["end"][:4]) + 1)
+    resubmits = {y: 0 for y in years}
+    last_count = {y: (-1, time.monotonic()) for y in years}   # (raw_count, time first seen at this count)
+    deadline = time.monotonic() + args.max_hours * 3600
+
+    while True:
+        done = years_done(cfg, years)
+        running = running_tasks()
+        up = server_up()
+        n_done = sum(done.values())
+        log.info("cycle: %d/%d years complete | running=%s | GES DISC %s",
+                 n_done, len(years), sorted(running), "up" if up else "DOWN")
+
+        if n_done < len(years) and up:
+            for y in years:
+                if done[y]:
+                    continue
+                if y not in running:
+                    if resubmits[y] < MAX_RESUBMITS:
+                        resubmits[y] += 1
+                        log.warning("year %d incomplete and not queued -- resubmitting "
+                                    "(#%d)", y, resubmits[y])
+                        resubmit(sbatch, y, args.dry_run)
+                    else:
+                        log.error("year %d still incomplete after %d resubmits -- giving up",
+                                  y, MAX_RESUBMITS)
+                    continue
+                # running: stall detection on raw-granule growth
+                cnt = raw_count(cfg, y)
+                prev, since = last_count[y]
+                if cnt != prev:
+                    last_count[y] = (cnt, time.monotonic())
+                elif (time.monotonic() - since) > args.stall_min * 60 and cnt >= 0:
+                    if resubmits[y] < MAX_RESUBMITS:
+                        jid = task_jobid(y)
+                        log.warning("year %d STALLED at %d granules for >%dmin -- "
+                                    "cancelling %s and resubmitting", y, cnt,
+                                    args.stall_min, jid)
+                        if jid and not args.dry_run:
+                            sh(["scancel", jid])
+                        resubmits[y] += 1
+                        resubmit(sbatch, y, args.dry_run)
+                        last_count[y] = (-1, time.monotonic())
+
+        # all data in -> trigger downstream analysis, then QC the figures
+        if n_done == len(years):
+            png = cfg["paths"]["figures_dir"] / "map_usa_feasibility.png"
+            if not png.exists():
+                if usa_job_active():
+                    log.info("data complete; downstream USA analysis running, awaiting figures")
+                else:
+                    log.warning("all %d years reduced -- launching downstream USA analysis",
+                                len(years))
+                    submit_downstream(Path(args.usa_sbatch), args.dry_run)
+            else:
+                issues = figure_qc(cfg)
+                report = [f"NLDAS QC report -- {n_done}/{len(years)} years complete",
+                          "resubmits: " + (", ".join(f"{y}:{c}" for y, c in resubmits.items() if c)
+                                           or "none"), ""]
+                report += issues or ["figures: no layout issues detected"]
+                write_report(cfg, report)
+                log.info("QCagent done: data complete, figures checked")
+                return
+
+        if args.once:
+            return
+        if time.monotonic() > deadline:
+            log.error("QCagent hit wall-clock cap with %d/%d years done", n_done, len(years))
+            write_report(cfg, [f"TIMEOUT: {n_done}/{len(years)} years complete"])
+            sys.exit(2)
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    main()

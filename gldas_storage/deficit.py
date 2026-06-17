@@ -76,19 +76,21 @@ def make_demand(cfg: dict, dates: pd.DatetimeIndex,
 
 def analyze_region(cf: np.ndarray, dates: pd.DatetimeIndex, demand: np.ndarray,
                    storage_cfg: dict, steps_per_year: int,
-                   simulate: bool = True, overbuild: float = 1.0) -> RegionResult:
+                   simulate: bool = True, norm_mean: float | None = None) -> RegionResult:
     """Run the full net + loss-adjusted cumulative deficit analysis for one region.
 
     storage_cfg holds up_efficiency, down_efficiency, annual_decay,
     max_iterations, tolerance (the ``storage`` block of the config, or an
     archetype with max_iterations/tolerance merged in).
 
-    ``overbuild`` (>= 1) installs that multiple of the deficit-covering capacity --
-    the co-location scenario's (1+k): the same land carries (1+k)x the optimal-mix
-    capacity, so the surplus shrinks the storage need. It scales ``net_factor`` (the
-    seed of the f_adj loss iteration), which is the only scale the analysis is not
-    invariant to (cf is internally mean-normalized, so multiplying the supply series
-    would have no effect). See colocation_scenario.md.
+    ``norm_mean`` is the reference used to normalize the supply magnitude. By
+    default (None) the series is divided by its own mean, so the analysis is
+    scale-invariant. The co-location scenario instead passes the BASELINE mix
+    mean (1.0): the overlapped supply ``a*sol + b*win`` has mean ``a + b >= 1``,
+    and referencing it to the baseline mean lets that extra production survive as
+    real surplus (which draws down storage) rather than being normalized away.
+    ``f`` (net_factor) is always re-derived from ``cf`` itself; co-location never
+    multiplies it. See colocation_maps.recompute.
     """
     dt = 1.0 / steps_per_year
     up = storage_cfg["up_efficiency"]
@@ -100,12 +102,14 @@ def analyze_region(cf: np.ndarray, dates: pd.DatetimeIndex, demand: np.ndarray,
     mean_cf = cf.mean()
     if not np.isfinite(mean_cf) or mean_cf <= 0.0:
         return RegionResult(0.0, np.nan, np.nan, np.nan, np.nan, 0, False)
+    # magnitude reference: own mean (scale-invariant) unless a baseline mean is
+    # supplied (co-location), in which case the extra production is kept as surplus
+    scale = mean_cf if norm_mean is None else norm_mean
 
     # --- net analysis (no losses), Deficit.R lines 18-33 -------------------
     annual = pd.Series(cf, index=dates).groupby(dates.year).mean()
     net_factor = annual.mean() / annual.min()
-    net_factor *= overbuild        # co-location (1+k) overbuild; 1.0 = no change
-    supply = cf / mean_cf * net_factor
+    supply = cf / scale * net_factor
     net_deficit = positive_running_sum((demand - supply) * dt)
     s_net = net_deficit.max()
 
@@ -119,7 +123,7 @@ def analyze_region(cf: np.ndarray, dates: pd.DatetimeIndex, demand: np.ndarray,
     iterations = 0
     for iterations in range(1, storage_cfg["max_iterations"] + 1):
         tot_factor = net_factor * (1 + tot_loss)
-        tot_supply = cf / mean_cf * tot_factor
+        tot_supply = cf / scale * tot_factor
         diff = demand - tot_supply
         shortfall = diff > 0
         x = np.where(shortfall, diff / down, diff * up) * dt

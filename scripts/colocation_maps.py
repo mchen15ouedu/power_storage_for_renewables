@@ -1,20 +1,36 @@
 """Co-location feasibility maps: how the optimal-mix storage requirement shrinks
-when solar and wind share the same land (the proportional overbuild scenario).
+when solar and wind share the same land via a co-located overlap area.
 
-For every region it reuses the storage-optimal solar share alpha* from
-results/summary.csv (which is essentially independent of the co-location factor k,
-see colocation_scenario.md), rebuilds the optimal mix from the zonal series, and
-recomputes the storage need S_tot with a (1+k) overbuild via
-``deficit.analyze_region(..., overbuild=1+k)`` for k in {0, 0.17, 0.35, 0.50}.
+The baseline land is already split into the storage-optimal shares alpha* (solar)
+and 1 - alpha* (wind); alpha* is optimized ONCE for the baseline and is fixed for
+life (reused from results/summary.csv). Co-location adds an overlap area k on top
+of that fixed split. Because the infrastructure is built once, the overlap cannot
+be divided: the WHOLE of k is dedicated either to solar or to wind. Which one is a
+second, BINARY optimization per region -- pick the assignment that minimizes
+storage:
 
-Storage is reported as % of annual CONSUMPTION (a fixed denominator -- unlike
-"% of production", whose denominator (1+k)*f_adj would itself inflate with k).
+    give k to solar:  supply = min(alpha + k, 1) * sol + (1 - alpha)      * win
+    give k to wind:   supply =      alpha        * sol + min(1-alpha+k, 1)* win
+    (sol, win mean-normalized; total mean = 1 + k either way -- k counted ONCE)
+
+The winning (lower-storage) assignment is kept. Its overlapped series is analysed
+at its REAL magnitude (mean 1 + k, referenced to the baseline mix mean of 1 so the
+extra production survives as surplus rather than being normalized away); the
+excess-installation factor f is re-derived from that series -- k never multiplies
+net_factor. k in {0, 0.17, 0.35, 0.50} (k = 0 = baseline, no overlap).
+
+Storage is reported on FIXED, k-independent denominators: % of annual
+CONSUMPTION (s_tot) for the USA/NLDAS run, and % of baseline (k=0) annual
+PRODUCTION (s_tot / f_adj at k=0) for the world/GLDAS run.
 
 Outputs:
-  results/colocation_storage.csv          -- per region, S_tot at each k;
+  results/colocation_storage.csv          -- per region, the min storage at each k
+      plus which technology won the overlap (kN_pick);
   figures/map_colocation_feasibility.png  -- binary "sustainable (<= threshold)"
-      world maps, one column per co-location level (baseline + 17/35/50 %),
-      one row per storage threshold.
+      world maps, one column per overlap level (baseline + 17/35/50 %), one row
+      per storage threshold. For k > 0 a sustainable region is colored by which
+      technology the overlap was assigned to (wind vs solar); k = 0 uses a single
+      baseline color.
 
 Usage:
   python scripts/colocation_maps.py [--config hpc/config_oscer.yaml]
@@ -43,8 +59,9 @@ from gldas_storage.config import load_config
 
 log = logging.getLogger(__name__)
 
-K_LEVELS = [0.0, 0.17, 0.35, 0.50]      # 0 = baseline; 17/35/50 % co-location
-FEASIBLE_C, FAIL_C, NODATA_C = "#1a9850", "#d9d9d9", "#f7f7f7"
+K_LEVELS = [0.0, 0.17, 0.35, 0.50]      # 0 = baseline; 17/35/50 % overlap area
+BASE_C, WIND_C, SOLAR_C = "#1a9850", "#4575b4", "#f1a340"   # k=0 / overlap→wind / →solar
+FAIL_C, NODATA_C = "#d9d9d9", "#f7f7f7"
 
 
 def kcol(k: float) -> str:
@@ -52,7 +69,17 @@ def kcol(k: float) -> str:
 
 
 def recompute(cfg: dict, regions: gpd.GeoDataFrame, summary: pd.DataFrame) -> pd.DataFrame:
-    """Per-region optimal-mix S_tot (% of consumption) at each co-location level."""
+    """Per-region optimal-mix S_tot at each co-location overlap level k.
+
+    For each k > 0 the WHOLE overlap area goes either to solar (share alpha + k)
+    or to wind (share 1 - alpha + k), each capped at full land; the assignment
+    that needs less storage is kept (a binary choice -- the overlap can't be
+    split). The chosen overlapped supply is analysed at its real magnitude
+    (norm_mean=1, the baseline mix mean). Storage is reported on two FIXED
+    denominators: % of annual consumption (s_tot) and % of baseline (k=0) annual
+    production (s_tot divided by the k=0 loss-adjusted install factor f_adj). The
+    winning technology is recorded in kN_pick.
+    """
     spy = analyze.steps_per_year(cfg)
     storage_cfg = cfg["storage"]
     alpha_by_id = dict(zip(summary["region_id"].astype(int), summary["mix_alpha"]))
@@ -70,18 +97,35 @@ def recompute(cfg: dict, regions: gpd.GeoDataFrame, summary: pd.DataFrame) -> pd
         s, w = cf_df["solar"].to_numpy(), cf_df["wind"].to_numpy()
         if s.mean() <= 0 or w.mean() <= 0:
             continue
-        mix = alpha * (s / s.mean()) + (1 - alpha) * (w / w.mean())
+        ns, nw = s / s.mean(), w / w.mean()      # mean-normalized (each mean 1)
         demand = deficit.make_demand(cfg, cf_df.index, tair=cf_df["tair"].to_numpy(),
                                      monthly=analyze.monthly_demand_profile(cfg, rid))
         row = {"region_id": rid, "name": meta.loc[rid, "name"], "mix_alpha": alpha}
+        base_factor = None                       # f_adj at k=0 -> fixed prod denom
         for k in K_LEVELS:
-            res = deficit.analyze_region(mix, cf_df.index, demand, storage_cfg, spy,
-                                         simulate=False, overbuild=1.0 + k)
-            # store BOTH bases: % of annual consumption (s_tot) and % of annual
-            # production (= consumption / overbuilt installation factor f_adj)
-            row[f"{kcol(k)}_cons"] = res.s_tot * 100.0
-            row[f"{kcol(k)}_prod"] = (res.s_tot / res.tot_factor * 100.0
-                                      if res.tot_factor and res.tot_factor > 0 else np.nan)
+            if k == 0.0:                         # baseline: no overlap to assign
+                chosen = deficit.analyze_region(
+                    alpha * ns + (1.0 - alpha) * nw, cf_df.index, demand,
+                    storage_cfg, spy, simulate=False, norm_mean=1.0)
+                base_factor = chosen.tot_factor
+                pick = "base"
+            else:
+                # BINARY choice: the whole overlap k goes to solar OR to wind
+                # (built once, can't be split); keep the lower-storage assignment
+                res_s = deficit.analyze_region(
+                    min(alpha + k, 1.0) * ns + (1.0 - alpha) * nw, cf_df.index,
+                    demand, storage_cfg, spy, simulate=False, norm_mean=1.0)
+                res_w = deficit.analyze_region(
+                    alpha * ns + min((1.0 - alpha) + k, 1.0) * nw, cf_df.index,
+                    demand, storage_cfg, spy, simulate=False, norm_mean=1.0)
+                chosen, pick = ((res_s, "solar") if res_s.s_tot <= res_w.s_tot
+                                else (res_w, "wind"))
+            # store BOTH bases on FIXED denominators plus the winning assignment:
+            # % of annual consumption (s_tot) and % of baseline (k=0) production
+            row[f"{kcol(k)}_cons"] = chosen.s_tot * 100.0
+            row[f"{kcol(k)}_prod"] = (chosen.s_tot / base_factor * 100.0
+                                      if base_factor and base_factor > 0 else np.nan)
+            row[f"{kcol(k)}_pick"] = pick
         rows.append(row)
         if len(rows) % 100 == 0:
             log.info("  %d regions done", len(rows))
@@ -97,16 +141,18 @@ def make_figure(gdf: gpd.GeoDataFrame, thresholds: list[float], n: int,
                 dataset: str, period: str, out: Path,
                 bounds: dict | None = None, demand_label: str = "consumption") -> None:
     nrow, ncol = len(thresholds), len(K_LEVELS)
-    fig = plt.figure(figsize=(4.6 * ncol, 2.6 * nrow + 1.2))
-    gs = fig.add_gridspec(nrow, ncol, hspace=0.16, wspace=0.03,
-                          left=0.04, right=0.99, top=0.84, bottom=0.02)
-    fig.suptitle(f"Solar+wind sustainable regions vs. co-location overbuild k\n"
+    fig = plt.figure(figsize=(4.6 * ncol, 3.1 * nrow + 1.2))
+    gs = fig.add_gridspec(nrow, ncol, hspace=0.14, wspace=0.03,
+                          left=0.05, right=0.99, top=0.86, bottom=0.02)
+    fig.suptitle(f"Solar+wind sustainable regions vs. co-location overlap area k\n"
                  f"(optimal-mix storage, {dataset} {period}; storage as % of annual "
                  f"{demand_label})", fontsize=14, weight="bold", y=0.985)
-    fig.legend(handles=[Patch(facecolor=FEASIBLE_C, label="sustainable (≤ threshold)"),
+    fig.legend(handles=[Patch(facecolor=BASE_C, label="sustainable — no overlap"),
+                        Patch(facecolor=WIND_C, label="sustainable — overlap → wind"),
+                        Patch(facecolor=SOLAR_C, label="sustainable — overlap → solar"),
                         Patch(facecolor=FAIL_C, label="above threshold"),
                         Patch(facecolor=NODATA_C, edgecolor="0.6", label="no data")],
-               loc="center", ncol=3, fontsize=11, frameon=True,
+               loc="center", ncol=5, fontsize=10, frameon=True,
                bbox_to_anchor=(0.5, 0.90))
 
     for ri, t in enumerate(thresholds):
@@ -115,18 +161,26 @@ def make_figure(gdf: gpd.GeoDataFrame, thresholds: list[float], n: int,
             col = kcol(k)
             metric = gdf[col]
             valid = metric.notna()
-            mask = metric <= t
+            sustain = valid & (metric <= t)
             _draw(ax, gdf[~valid], NODATA_C)
-            _draw(ax, gdf[valid & mask], FEASIBLE_C)
-            _draw(ax, gdf[valid & ~mask], FAIL_C)
-            cnt = int((valid & mask).sum())
+            _draw(ax, gdf[valid & (metric > t)], FAIL_C)
+            if k == 0:                            # baseline: single color
+                _draw(ax, gdf[sustain], BASE_C)
+            else:                                 # color by overlap assignment
+                pick = gdf[f"{col}_pick"]
+                _draw(ax, gdf[sustain & (pick == "wind")], WIND_C)
+                _draw(ax, gdf[sustain & (pick == "solar")], SOLAR_C)
+            cnt = int(sustain.sum())
             klab = "no co-location" if k == 0 else f"{int(round(k*100))}% co-location"
+            cnt_lab = f"{cnt}/{n} ({100*cnt/n:.0f}%)"   # sustainable / total regions
+            # top row carries the co-location-level header above the count; every
+            # row carries the count (the threshold itself is on the y-axis label)
             if ri == 0:
-                ax.set_title(f"{klab}\n≤{t:g}%: {cnt}/{n} ({100*cnt/n:.0f}%)", fontsize=9)
+                ax.set_title(f"{klab}\n{cnt_lab}", fontsize=10)
             else:
-                ax.set_title(f"≤{t:g}%: {cnt}/{n} ({100*cnt/n:.0f}%)", fontsize=9)
+                ax.set_title(cnt_lab, fontsize=9)
             if ci == 0:
-                ax.set_ylabel(f"threshold {t:g}%", fontsize=10)
+                ax.set_ylabel(f"Store {t:g}% of annual {demand_label}", fontsize=11)
             if bounds:
                 ax.set_xlim(*bounds["xlim"]); ax.set_ylim(*bounds["ylim"])
             ax.set_xticks([]); ax.set_yticks([])
@@ -194,7 +248,8 @@ def main() -> None:
     period = f"{cfg['period']['start'][:4]}-{cfg['period']['end'][:4]}"
     # rename the basis-appropriate columns to the bare kcol() the figure expects
     rename = {f"{kcol(k)}_{suffix}": kcol(k) for k in K_LEVELS}
-    sub = data[["region_id"] + list(rename)].rename(columns=rename)
+    pickcols = [f"{kcol(k)}_pick" for k in K_LEVELS]
+    sub = data[["region_id"] + list(rename) + pickcols].rename(columns=rename)
     gdf = regions.merge(sub, on="region_id", how="left")
     bounds = {"xlim": (-126, -66), "ylim": (23, 50)} if args.conus else None
     make_figure(gdf, thresholds, n, dataset, period,

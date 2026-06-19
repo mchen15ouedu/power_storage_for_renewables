@@ -36,16 +36,27 @@ REPO="${HOME}/gldas_storage"
 SELF="${REPO}/hpc/oscer_pipeline_watchdog.sbatch"
 NODE=$(hostname -s); BADFILE="${REPO}/hpc/bad_nodes.txt"
 
-# ENV GUARD: relocate off a node where the env didn't load (record it for OSCER).
-if ! python -c "import yaml" 2>/dev/null; then
-    echo "watchdog: ENV BROKEN on ${NODE} -- relocating" >&2
-    printf '%s\t%s\tjob=%s\twatchdog env failed\n' \
-        "$(date -u +%FT%TZ)" "${NODE}" "${SLURM_JOB_ID:-?}" >> "${BADFILE}"
+# ENV GUARD (RETRY): retry before relocating (transient cold-start import failures).
+ENV_OK=0; ENV_ERR=""
+for t in 1 2 3 4 5; do
+    conda activate geo2 2>/dev/null || true
+    if ENV_ERR=$(python -c "import yaml, pandas" 2>&1); then ENV_OK=1; break; fi
+    echo "watchdog: env check ${t}/5 on ${NODE} failed: ${ENV_ERR}" >&2
+    sleep $((t * 5))
+done
+if [ "${ENV_OK}" -ne 1 ]; then
+    echo "watchdog: ENV BROKEN on ${NODE} after 5 tries -- relocating" >&2
+    printf '%s\t%s\tjob=%s\t%s\n' \
+        "$(date -u +%FT%TZ)" "${NODE}" "${SLURM_JOB_ID:-?}" "${ENV_ERR//$'\n'/ }" >> "${BADFILE}"
     EXCL=$(awk -F'\t' 'NF>1{print $2}' "${BADFILE}" | sort -u | paste -sd, -)
     sbatch --exclude="${EXCL}" "${SELF}" || sbatch "${SELF}"
     exit 0
 fi
 
 # The job IS this continuous python program (deterministic checks every 5 min).
+# TARGET=zonal (default) watches the zonal download; TARGET=pixel watches the
+# per-pixel re-download campaign (relaunches a matching-mode QCagent if it dies).
+#   sbatch --export=ALL,TARGET=pixel hpc/oscer_pipeline_watchdog.sbatch
 exec python "${REPO}/scripts/pipeline_watchdog.py" \
-    --config "${REPO}/hpc/config_nldas.yaml" --interval 300 --stale-min 35
+    --config "${REPO}/hpc/config_nldas.yaml" --target "${TARGET:-zonal}" \
+    --interval 300 --stale-min 35

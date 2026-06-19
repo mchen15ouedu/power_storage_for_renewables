@@ -76,15 +76,32 @@ def zonal_count(cfg) -> int:
     return len(list(Path(cfg["paths"]["zonal_dir"]).glob("zonal_*.parquet")))
 
 
-def read_status(cfg) -> tuple[dict, float]:
-    """QCagent heartbeat json + its age in seconds (inf if absent)."""
-    f = Path(cfg["paths"]["results_dir"]) / "qcagent_status.json"
+def read_status(cfg, target="zonal") -> tuple[dict, float]:
+    """QCagent heartbeat json + its age in seconds (inf if absent), per target."""
+    name = "qcagent_status.json" if target == "zonal" else f"qcagent_{target}_status.json"
+    f = Path(cfg["paths"]["results_dir"]) / name
     if not f.exists():
         return {}, float("inf")
     try:
         return json.loads(f.read_text()), time.time() - f.stat().st_mtime
     except Exception:
         return {}, float("inf")
+
+
+def pixel_years_done(cfg, years, min_steps: int = 8000) -> int:
+    """Count years whose per-pixel CF parquet exists with a near-full hour count."""
+    import pandas as pd
+    d = Path(cfg["paths"]["data_dir"]) / "pixel_cf"
+    n = 0
+    for y in years:
+        f = d / f"pixel_cf_{y}.parquet"
+        if f.exists():
+            try:
+                if int(pd.read_parquet(f, columns=["n_steps"])["n_steps"].max()) >= min_steps:
+                    n += 1
+            except Exception:
+                pass
+    return n
 
 
 def bad_nodes() -> list[str]:
@@ -138,33 +155,41 @@ def main() -> None:
     ap.add_argument("--usa-sbatch", default=REPO / "hpc" / "oscer_nldas_usa.sbatch")
     ap.add_argument("--interval", type=int, default=300, help="seconds between checks")
     ap.add_argument("--stale-min", type=int, default=35, help="QCagent heartbeat staleness = hung")
+    ap.add_argument("--target", choices=["zonal", "pixel"], default="zonal",
+                    help="which campaign to watch: zonal download or the per-pixel re-download")
+    ap.add_argument("--min-steps", type=int, default=8000)
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     cfg = load_config(args.config)
+    tgt = args.target
     years = range(int(cfg["period"]["start"][:4]), int(cfg["period"]["end"][:4]) + 1)
-    total_months = len(years) * 12
+    total = len(years) if tgt == "pixel" else len(years) * 12
+    # relaunch the QCagent in the SAME target mode it is watching
+    qc_relaunch = ([f"--export=ALL,TARGET={tgt},MIN_STEPS={args.min_steps}", str(args.qc_sbatch)]
+                   if tgt == "pixel" else [str(args.qc_sbatch)])
     seen_bad: set[str] = set(bad_nodes())
     qc_relaunch_at = 0.0          # debounce: don't relaunch QCagent more than ~1/10min
+    log.info("watchdog target=%s (total=%d)", tgt, total)
 
     while True:
         q = jobs_by_name()
-        nz = zonal_count(cfg)
-        status, age = read_status(cfg)
+        nz = pixel_years_done(cfg, years, args.min_steps) if tgt == "pixel" else zonal_count(cfg)
+        status, age = read_status(cfg, tgt)
         up = server_up()
         bn = bad_nodes()
         qc_states = [s for _, s in q.get("QCagent", [])]
         usa_states = [s for _, s in q.get("nldas_usa", [])]
         zonal_q = q.get("nldas_zonal", [])
         gave_up = status.get("gave_up", []) if status else []
-        complete = nz >= total_months
+        complete = nz >= total
 
-        log.info("zonal %d/%d | QCagent=%s (hb %.0fmin) | nldas_usa=%s | nldas_zonal=%d | "
+        log.info("%s %d/%d | QCagent=%s (hb %.0fmin) | nldas_zonal jobs=%d | "
                  "gave_up=%s | bad_nodes=%s | GES DISC %s",
-                 nz, total_months, qc_states or "absent",
-                 (age / 60 if age != float("inf") else -1), usa_states or "absent",
+                 tgt, nz, total, qc_states or "absent",
+                 (age / 60 if age != float("inf") else -1),
                  len(zonal_q), gave_up or [], bn or [], "up" if up else "DOWN")
 
         # new bad nodes -> surface for the OSCER report
@@ -175,17 +200,17 @@ def main() -> None:
 
         handled_anomaly = True
         if not complete and up:
-            # 1. QCagent absent while work remains -> relaunch (debounced)
+            # 1. QCagent absent while work remains -> relaunch (debounced), same target
             if not qc_states and (time.monotonic() - qc_relaunch_at) > 600:
-                log.warning("QCagent absent and zonal incomplete -- relaunching")
-                submit([str(args.qc_sbatch)], args.dry_run)
+                log.warning("QCagent absent and %s incomplete -- relaunching (target=%s)", tgt, tgt)
+                submit(qc_relaunch, args.dry_run)
                 qc_relaunch_at = time.monotonic()
             # 2. QCagent present but heartbeat stale -> hung; scancel + relaunch
             elif qc_states and age > args.stale_min * 60 and (time.monotonic() - qc_relaunch_at) > 600:
                 log.warning("QCagent heartbeat stale (%.0fmin) -- scancel + relaunch", age / 60)
                 for jid, _ in q.get("QCagent", []):
                     cancel(jid, args.dry_run)
-                submit([str(args.qc_sbatch)], args.dry_run)
+                submit(qc_relaunch, args.dry_run)
                 qc_relaunch_at = time.monotonic()
             # 3. given-up years not in the queue -> resubmit (sbatch self-excludes bad nodes)
             queued_years = {int(k.split("%")[0].split("-")[0]) for k, _ in zonal_q if k[:4].isdigit()}
@@ -194,13 +219,16 @@ def main() -> None:
                     log.warning("resubmitting given-up year %s", y)
                     submit([f"--array={y}", str(args.zonal_sbatch)], args.dry_run)
         elif complete:
-            # 4. all data in; ensure downstream USA analysis runs once
-            fig = Path(cfg["paths"]["figures_dir"]) / "map_usa_feasibility.png"
-            if not fig.exists() and not usa_states:
-                log.warning("data complete, USA analysis missing -- submitting it")
-                submit([str(args.usa_sbatch)], args.dry_run)
+            if tgt == "zonal":
+                # all zonal in; ensure the downstream USA analysis runs once
+                fig = Path(cfg["paths"]["figures_dir"]) / "map_usa_feasibility.png"
+                if not fig.exists() and not usa_states:
+                    log.warning("data complete, USA analysis missing -- submitting it")
+                    submit([str(args.usa_sbatch)], args.dry_run)
+                else:
+                    log.info("pipeline complete (or downstream running); nothing to do")
             else:
-                log.info("pipeline complete (or downstream running); nothing to do")
+                log.info("all %d per-pixel years complete; siting handled by the QCagent", total)
         elif not up:
             log.info("GES DISC down -- holding (no resubmits)")
         else:
@@ -208,9 +236,8 @@ def main() -> None:
 
         # novel anomaly: not progressing and none of the rules applied
         if not handled_anomaly:
-            alert(cfg, f"unclassified state: zonal {nz}/{total_months}, QCagent={qc_states}, "
-                       f"usa={usa_states}, gave_up={gave_up}")
-            ask_claude(cfg, f"zonal={nz}/{total_months} QCagent={qc_states} usa={usa_states} "
+            alert(cfg, f"unclassified {tgt} state: {nz}/{total}, QCagent={qc_states}, gave_up={gave_up}")
+            ask_claude(cfg, f"target={tgt} {nz}/{total} QCagent={qc_states} "
                             f"gave_up={gave_up} bad_nodes={bn} server_up={up}")
 
         if args.once:

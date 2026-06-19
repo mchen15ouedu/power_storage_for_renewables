@@ -50,22 +50,31 @@ LIST=/scratch/mchen15/nldas/nldas_list.txt
 RAW=/scratch/mchen15/nldas/raw/${YEAR}
 mkdir -p "${RAW}"
 
-# --- ENV GUARD: verify geo2 actually loaded on THIS node (else base python has no
-#     geopandas and the reduction would crash after a full download). On failure,
-#     record the node for an OSCER report and resubmit EXCLUDING all bad nodes. ---
+# --- ENV GUARD (RETRY): verify geo2 actually loaded on THIS node. The first import
+#     after `conda activate` on a cold node can fail TRANSIENTLY (NFS/Lustre lag,
+#     activation race) -- a no-retry guard once blacklisted 35 good nodes in seconds.
+#     So retry with backoff and only relocate after SUSTAINED failure (a real bad node),
+#     logging the actual error for the OSCER report. ---
 NODE=$(hostname -s)
 BADFILE="${REPO}/hpc/bad_nodes.txt"
-if ! python -c "import geopandas, pyarrow, xarray" 2>/dev/null; then
-    echo "${YEAR}: ENV BROKEN on ${NODE} -- geo2 not active (geopandas/pyarrow/xarray missing)" >&2
-    printf '%s\t%s\tyear=%s\tjob=%s\tgeo2 import failed\n' \
-        "$(date -u +%FT%TZ)" "${NODE}" "${YEAR}" "${SLURM_JOB_ID:-?}" >> "${BADFILE}"
+ENV_OK=0; ENV_ERR=""
+for t in 1 2 3 4 5; do
+    conda activate geo2 2>/dev/null || true
+    if ENV_ERR=$(python -c "import geopandas, pyarrow, xarray" 2>&1); then ENV_OK=1; break; fi
+    echo "${YEAR}: env check ${t}/5 on ${NODE} failed: ${ENV_ERR}" >&2
+    sleep $((t * 5))
+done
+if [ "${ENV_OK}" -ne 1 ]; then
+    echo "${YEAR}: ENV BROKEN on ${NODE} after 5 tries -- relocating" >&2
+    printf '%s\t%s\tyear=%s\tjob=%s\t%s\n' \
+        "$(date -u +%FT%TZ)" "${NODE}" "${YEAR}" "${SLURM_JOB_ID:-?}" "${ENV_ERR//$'\n'/ }" >> "${BADFILE}"
     EXCL=$(awk -F'\t' 'NF>1{print $2}' "${BADFILE}" | sort -u | paste -sd, -)
     echo "${YEAR}: resubmitting --exclude=${EXCL}" >&2
     sbatch --array="${YEAR}" --exclude="${EXCL}" "${SELF}" \
         || sbatch --array="${YEAR}" "${SELF}"
     exit 0
 fi
-echo "${YEAR}: env OK on ${NODE}"
+echo "${YEAR}: env OK on ${NODE} (try ${t})"
 
 # --- Earthdata Login bearer token (GES DISC token-based authorization) ------
 TOKEN_FILE="${EARTHDATA_TOKEN_FILE:-$HOME/.edl_token}"

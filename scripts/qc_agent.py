@@ -60,16 +60,37 @@ def server_up() -> bool:
     return out.strip() in ("200", "301", "302", "401", "403")  # reachable (auth codes still mean "up")
 
 
-def years_done(cfg: dict, years: range) -> dict[int, bool]:
+def pixel_done(cfg: dict, year: int, min_steps: int) -> bool:
+    """A per-pixel year is done when its pixel_cf parquet exists with a near-full
+    hour count (partial-download years have a low n_steps and don't count)."""
+    f = Path(cfg["paths"]["data_dir"]) / "pixel_cf" / f"pixel_cf_{year}.parquet"
+    if not f.exists():
+        return False
+    try:
+        import pandas as pd
+        return int(pd.read_parquet(f, columns=["n_steps"])["n_steps"].max()) >= min_steps
+    except Exception:
+        return False
+
+
+def years_done(cfg: dict, years: range, target: str = "zonal",
+               min_steps: int = 8000) -> dict[int, bool]:
     zdir = cfg["paths"]["zonal_dir"]
     done = {}
     for y in years:
-        n = len(list(zdir.glob(f"zonal_{y}*.parquet")))
-        done[y] = n >= 12
+        if target == "pixel":
+            done[y] = pixel_done(cfg, y, min_steps)
+        else:
+            done[y] = len(list(zdir.glob(f"zonal_{y}*.parquet"))) >= 12
     return done
 
 
-def parquet_count(cfg: dict, year: int) -> int:
+def progress_count(cfg: dict, year: int, target: str) -> int:
+    """A monotone signal that the year is making progress, used to reset the
+    resubmit budget: reduced parquets for zonal, downloaded raw granules for pixel
+    (whose product is one parquet, so raw growth is the live progress signal)."""
+    if target == "pixel":
+        return raw_count(cfg, year)
     return len(list(cfg["paths"]["zonal_dir"].glob(f"zonal_{year}*.parquet")))
 
 
@@ -83,12 +104,15 @@ def bad_nodes() -> list[str]:
                    if "\t" in ln and len(ln.split("\t")) > 1})
 
 
-def write_status(cfg: dict, **kv) -> None:
-    """Heartbeat the QCagent's state to results/qcagent_status.json so an external
-    monitor (the caps_rcm Claude watcher) can tell if it is healthy or stuck."""
+def write_status(cfg: dict, target: str = "zonal", **kv) -> None:
+    """Heartbeat the QCagent's state to results/qcagent[_<target>]_status.json so the
+    pipeline watchdog can tell if it is healthy or stuck (per-target file so a zonal
+    and a pixel QCagent don't clobber each other)."""
     import json
-    out = cfg["paths"]["results_dir"] / "qcagent_status.json"
+    name = "qcagent_status.json" if target == "zonal" else f"qcagent_{target}_status.json"
+    out = cfg["paths"]["results_dir"] / name
     out.parent.mkdir(parents=True, exist_ok=True)
+    kv["target"] = target
     kv["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     kv["bad_nodes"] = bad_nodes()
     out.write_text(json.dumps(kv, indent=2))
@@ -232,6 +256,10 @@ def main() -> None:
     ap.add_argument("--stall-min", type=int, default=90,
                     help="minutes of no new granules before a running task is deemed stalled")
     ap.add_argument("--max-hours", type=float, default=120.0, help="overall wall-clock cap")
+    ap.add_argument("--target", choices=["zonal", "pixel"], default="zonal",
+                    help="completion target: 12 zonal parquets/year, or the per-pixel CF parquet")
+    ap.add_argument("--min-steps", type=int, default=8000,
+                    help="(pixel) minimum reduced hours for a year to count as complete")
     ap.add_argument("--once", action="store_true", help="run a single cycle and exit")
     ap.add_argument("--dry-run", action="store_true", help="log resubmit/cancel actions but do not execute them")
     args = ap.parse_args()
@@ -240,15 +268,17 @@ def main() -> None:
 
     cfg = load_config(args.config)
     sbatch = Path(args.sbatch)
+    tgt = args.target
     years = range(int(cfg["period"]["start"][:4]), int(cfg["period"]["end"][:4]) + 1)
     resubmits = {y: 0 for y in years}
     last_count = {y: (-1, time.monotonic()) for y in years}   # (raw_count, time first seen at this count)
-    last_pq = {y: parquet_count(cfg, y) for y in years}       # reduction progress (zonal parquets)
+    last_pq = {y: progress_count(cfg, y, tgt) for y in years}  # reduction/download progress
     gave_up: set[int] = set()
     deadline = time.monotonic() + args.max_hours * 3600
+    log.info("QCagent target=%s (min_steps=%d)", tgt, args.min_steps)
 
     while True:
-        done = years_done(cfg, years)
+        done = years_done(cfg, years, tgt, args.min_steps)
         states = queue_states()                 # year -> RUNNING / PENDING
         queued = set(states)                    # pending OR running = still in the array
         running_now = {y for y, s in states.items() if s == "RUNNING"}
@@ -257,7 +287,7 @@ def main() -> None:
         log.info("cycle: %d/%d complete | running=%s | pending=%d | gave_up=%s | GES DISC %s",
                  n_done, len(years), sorted(running_now),
                  len(queued) - len(running_now), sorted(gave_up) or "none", "up" if up else "DOWN")
-        write_status(cfg, years_done=n_done, years_total=len(years),
+        write_status(cfg, tgt, years_done=n_done, years_total=len(years),
                      running=sorted(running_now), pending=len(queued) - len(running_now),
                      gave_up=sorted(gave_up), server_up=up,
                      resubmits={y: c for y, c in resubmits.items() if c})
@@ -268,12 +298,11 @@ def main() -> None:
                     continue
                 # reduction progress => the sbatch is self-healing (e.g. excluded a
                 # bad node and reran); clear the give-up state and resubmit budget.
-                pq = parquet_count(cfg, y)
+                pq = progress_count(cfg, y, tgt)
                 if pq > last_pq[y]:
                     last_pq[y] = pq
                     if resubmits[y] or y in gave_up:
-                        log.info("year %d progressed to %d/12 parquets -- resetting "
-                                 "resubmit budget", y, pq)
+                        log.info("year %d progressed (%d) -- resetting resubmit budget", y, pq)
                     resubmits[y] = 0
                     gave_up.discard(y)
                 if y not in queued:
@@ -315,8 +344,22 @@ def main() -> None:
                         resubmit(sbatch, y, args.dry_run)
                         last_count[y] = (-1, time.monotonic())
 
-        # all data in -> trigger downstream analysis, then QC the figures
+        # all data in -> trigger the downstream product, then finish
         if n_done == len(years):
+            if tgt == "pixel":
+                # all per-pixel CF in -> run the optimal-siting analysis + maps once
+                map_png = cfg["paths"]["figures_dir"] / "map_usa_siting_landcaps.png"
+                if not map_png.exists() or not args.dry_run:
+                    log.warning("all %d years' per-pixel CF ready -- running siting + maps", len(years))
+                    if not args.dry_run:
+                        sh(["python", str(REPO / "scripts" / "nldas_pixel_siting.py"),
+                            "--config", str(args.config)])
+                        sh(["python", str(REPO / "scripts" / "nldas_siting_maps.py"),
+                            "--config", str(args.config)])
+                write_report(cfg, [f"NLDAS per-pixel siting complete -- {n_done}/{len(years)} years",
+                                   f"bad nodes: {bad_nodes() or 'none'}"])
+                log.info("QCagent(pixel) done: all per-pixel years in, siting run")
+                return
             png = cfg["paths"]["figures_dir"] / "map_usa_feasibility.png"
             if not png.exists():
                 if usa_job_active():

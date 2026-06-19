@@ -36,12 +36,20 @@ set -u
 REPO=${HOME}/gldas_storage
 CFG="${REPO}/hpc/config_nldas.yaml"
 
-# ENV GUARD: relocate off a node where geo2 failed to load (would crash analysis)
+# ENV GUARD (RETRY): the first import on a cold node can fail transiently; retry
+# with backoff and only relocate after sustained failure (a real bad node).
 NODE=$(hostname -s); BADFILE="${REPO}/hpc/bad_nodes.txt"
-if ! python -c "import geopandas, pyarrow, xarray" 2>/dev/null; then
-    echo "nldas_usa: ENV BROKEN on ${NODE} -- relocating" >&2
-    printf '%s\t%s\tjob=%s\tnldas_usa env failed\n' \
-        "$(date -u +%FT%TZ)" "${NODE}" "${SLURM_JOB_ID:-?}" >> "${BADFILE}"
+ENV_OK=0; ENV_ERR=""
+for t in 1 2 3 4 5; do
+    conda activate geo2 2>/dev/null || true
+    if ENV_ERR=$(python -c "import geopandas, pyarrow, xarray" 2>&1); then ENV_OK=1; break; fi
+    echo "nldas_usa: env check ${t}/5 on ${NODE} failed: ${ENV_ERR}" >&2
+    sleep $((t * 5))
+done
+if [ "${ENV_OK}" -ne 1 ]; then
+    echo "nldas_usa: ENV BROKEN on ${NODE} after 5 tries -- relocating" >&2
+    printf '%s\t%s\tjob=%s\t%s\n' \
+        "$(date -u +%FT%TZ)" "${NODE}" "${SLURM_JOB_ID:-?}" "${ENV_ERR//$'\n'/ }" >> "${BADFILE}"
     EXCL=$(awk -F'\t' 'NF>1{print $2}' "${BADFILE}" | sort -u | paste -sd, -)
     sbatch --exclude="${EXCL}" "${REPO}/hpc/oscer_nldas_usa.sbatch" \
         || sbatch "${REPO}/hpc/oscer_nldas_usa.sbatch"

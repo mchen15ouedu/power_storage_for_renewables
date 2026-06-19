@@ -23,8 +23,7 @@ mkdir -p logs
 module load Anaconda3/2022.05 2>/dev/null || true
 set +u
 source /opt/oscer/software/Anaconda3/2022.05/etc/profile.d/conda.sh
-conda activate geo2
-set -u
+conda activate geo2 || true     # transient activation failures handled by the retry guard
 
 REPO=${HOME}/gldas_storage
 SELF="${REPO}/hpc/oscer_qcagent.sbatch"
@@ -47,6 +46,7 @@ if [ "${ENV_OK}" -ne 1 ]; then
     sbatch --exclude="${EXCL}" "${SELF}" || sbatch "${SELF}"
     exit 0
 fi
+set -u          # env confirmed good
 
 # TARGET=zonal (default) babysits the zonal download; TARGET=pixel babysits the
 # per-pixel re-download campaign (same sbatch, different completion criterion).

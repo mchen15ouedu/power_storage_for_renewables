@@ -28,8 +28,7 @@ mkdir -p logs
 module load Anaconda3/2022.05 2>/dev/null || true
 set +u
 source /opt/oscer/software/Anaconda3/2022.05/etc/profile.d/conda.sh
-conda activate geo2
-set -u
+conda activate geo2 || true     # transient activation failures handled by the retry guard
 export PATH="${HOME}/.local/bin:${PATH}"        # for the opt-in claude escalation
 
 REPO="${HOME}/gldas_storage"
@@ -52,6 +51,7 @@ if [ "${ENV_OK}" -ne 1 ]; then
     sbatch --exclude="${EXCL}" "${SELF}" || sbatch "${SELF}"
     exit 0
 fi
+set -u          # env confirmed good
 
 # The job IS this continuous python program (deterministic checks every 5 min).
 # TARGET=zonal (default) watches the zonal download; TARGET=pixel watches the

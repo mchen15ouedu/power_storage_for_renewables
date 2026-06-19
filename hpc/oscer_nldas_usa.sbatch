@@ -30,8 +30,9 @@ mkdir -p logs
 module load Anaconda3/2022.05 2>/dev/null || true
 set +u
 source /opt/oscer/software/Anaconda3/2022.05/etc/profile.d/conda.sh
-conda activate geo2
-set -u
+conda activate geo2 || true     # transient activation failures handled by the retry guard
+# keep nounset OFF through the guard (conda's activate.d scripts read unset vars,
+# and set -e on an unprotected `conda activate` is what aborted jobs at 0 bytes)
 
 REPO=${HOME}/gldas_storage
 CFG="${REPO}/hpc/config_nldas.yaml"
@@ -55,6 +56,7 @@ if [ "${ENV_OK}" -ne 1 ]; then
         || sbatch "${REPO}/hpc/oscer_nldas_usa.sbatch"
     exit 0
 fi
+set -u          # env confirmed good -> re-enable nounset for the analysis below
 
 # guard: refuse to run if no zonal parquet exists yet
 N_PARQUET=$(find /ourdisk/hpc/caps/mchen15/nldas_full -name 'zonal_*.parquet' 2>/dev/null | wc -l)

@@ -40,8 +40,9 @@ mkdir -p logs
 module load Anaconda3/2022.05 2>/dev/null || true
 set +u
 source /opt/oscer/software/Anaconda3/2022.05/etc/profile.d/conda.sh
-conda activate geo2
-set -u
+conda activate geo2 || true     # transient activation failures handled by the retry guard
+# nounset stays OFF through the guard (set -e on an unprotected `conda activate` is
+# what aborted jobs at 0 bytes before the retry guard could run)
 
 YEAR=${SLURM_ARRAY_TASK_ID}
 REPO=${HOME}/gldas_storage
@@ -74,6 +75,7 @@ if [ "${ENV_OK}" -ne 1 ]; then
         || sbatch --array="${YEAR}" "${SELF}"
     exit 0
 fi
+set -u          # env confirmed good -> re-enable nounset for the rest
 echo "${YEAR}: env OK on ${NODE} (try ${t})"
 
 # --- Earthdata Login bearer token (GES DISC token-based authorization) ------

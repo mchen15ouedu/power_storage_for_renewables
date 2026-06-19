@@ -16,7 +16,7 @@
 #   sbatch hpc/oscer_nldas_usa.sbatch
 #
 #SBATCH --job-name=nldas_usa
-#SBATCH --partition=normal
+#SBATCH --partition=caps_rcm,normal
 #SBATCH --time=06:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

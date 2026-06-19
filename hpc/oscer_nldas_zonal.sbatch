@@ -26,7 +26,7 @@
 # Restartable: wget -c resumes partial files; reduced months are skipped.
 #
 #SBATCH --job-name=nldas_zonal
-#SBATCH --partition=normal
+#SBATCH --partition=caps_rcm,normal
 #SBATCH --time=2-00:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

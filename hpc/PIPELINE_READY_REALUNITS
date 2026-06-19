@@ -1,0 +1,4 @@
+Real-units USA/NLDAS pipeline armed 2026-06-17.
+TWh everywhere; wind = direct footprint; NREL 1% land cap-sizing;
+feasibility = meets demand within <=1% land; co-location k relaxes the land constraint.
+Validated end-to-end on GLDAS before arming.

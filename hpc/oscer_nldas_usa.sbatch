@@ -1,12 +1,17 @@
 #!/bin/bash
-# NLDAS USA downstream analysis: once all years are reduced to hourly zonal
-# parquet, run the same USA/EIA workflow as the GLDAS run, but on NLDAS:
-#   1. usa_eia_feasibility.py  -> usa_summary.csv, usa_storage_ranking.csv,
-#                                 map_usa_feasibility.png  (% of annual consumption)
-#   2. usa_eia_deficit_plots.py-> deficit_{solar,wind,mix}_USA_states_*.pdf,
-#                                 usa_months_unmet.csv
-# Outputs land in /ourdisk/hpc/caps/mchen15/nldas_analysis/{results,figures}/.
-# CONUS-only: Alaska & Hawaii are excluded (no NLDAS coverage).
+# NLDAS USA downstream analysis (REAL UNITS, TWh + NREL 1% land constraint):
+#   1. usa_eia_feasibility.py  -> usa_summary.csv (real-units + land cols),
+#                                 usa_cannot_meet_demand.csv, usa_storage_ranking.csv,
+#                                 map_usa_feasibility.png (feasible within 1% land, TWh)
+#   2. usa_eia_deficit_plots.py-> deficit_{solar,wind,mix}_USA_states_{supply,storage,
+#                                 normalized}.pdf (TWh; normalized = / monthly EIA),
+#                                 usa_months_unmet.csv (real TWh shortfalls)
+#   3. colocation_maps.py --land-feasibility -> map_colocation_feasibility.png
+#                                 (feasible within 1% land vs co-location k)
+# Wind counted at DIRECT footprint (spacing reused). Feasibility = meets demand
+# within the land cap; two caps reported: 1% (NREL) and 1.88% (2x onshore oil &
+# gas). Outputs in nldas_analysis/{results,figures}/.
+# CONUS-only: Alaska & Hawaii excluded (no NLDAS coverage).
 #
 #   sbatch hpc/oscer_nldas_usa.sbatch
 #
@@ -39,12 +44,21 @@ if [ "${N_PARQUET}" -eq 0 ]; then
     exit 1
 fi
 
+# readiness sentinel: the real-units (TWh + 1% land) USA pipeline rewrite is in
+# progress. Until the sentinel exists, no-op cleanly so QCagent's auto-trigger
+# does NOT run the stale fractional pipeline. Created when the rewrite is done.
+READY=${REPO}/hpc/PIPELINE_READY_REALUNITS
+if [ ! -f "${READY}" ]; then
+    echo "pipeline-ready sentinel ${READY} absent -- real-units rewrite not finished; skipping" >&2
+    exit 0
+fi
+
 python "${REPO}/scripts/usa_eia_feasibility.py"  --config "${CFG}"
 python "${REPO}/scripts/usa_eia_deficit_plots.py" --config "${CFG}"
 
 # co-location feasibility maps (k = 0/17/35/50 %), USA / CONUS, EIA monthly demand
 MONTHLY=/ourdisk/hpc/caps/mchen15/nldas_analysis/results/usa_eia_monthly_demand.csv
 python "${REPO}/scripts/colocation_maps.py" --config "${CFG}" \
-    --summary usa_summary.csv --monthly-csv "${MONTHLY}" --conus
+    --summary usa_summary.csv --monthly-csv "${MONTHLY}" --conus --land-feasibility
 
 echo "NLDAS USA analysis complete"

@@ -67,17 +67,18 @@ def mix_series(cf_df: pd.DataFrame, alpha: float) -> np.ndarray:
     return alpha * (s / s.mean()) + (1.0 - alpha) * (w / w.mean())
 
 
-def months_unmet(supply: np.ndarray, demand: np.ndarray,
-                 dates: pd.DatetimeIndex) -> tuple[int, int, float]:
-    """(#months supply<demand, total months, worst monthly shortfall %).
+def months_unmet(supply: np.ndarray, demand: np.ndarray, dates: pd.DatetimeIndex,
+                 cons_twh: float, spy: int) -> tuple[int, int, float]:
+    """(#months supply<demand, total months, worst monthly shortfall in TWh).
 
-    supply and demand are both mean-normalized (mean 1). Aggregated to calendar
-    months; a month counts as unmet when its mean generation < mean demand."""
+    supply and demand are mean-normalized (mean 1) at the mean-matched, no-overbuild
+    sizing. Aggregated to calendar months and rescaled to real energy with the
+    state's EIA consumption (per-step energy = norm * cons_twh / spy)."""
     df = pd.DataFrame({"supply": supply, "demand": demand}, index=dates)
-    m = df.resample("MS").mean()
+    m = (df * cons_twh / spy).resample("MS").sum()      # monthly TWh
     short = m["demand"] - m["supply"]
     n_unmet = int((short > 0).sum())
-    worst = float((short / m["demand"]).max() * 100.0)
+    worst = float(short.max())                          # worst monthly shortfall, TWh
     return n_unmet, int(len(m)), worst
 
 
@@ -108,15 +109,23 @@ def main() -> None:
     cfg["demand"]["profile"] = "monthly"
     cfg["demand"]["monthly_csv"] = str(monthly_csv)
 
-    # storage-optimal solar share per state, from the feasibility summary
+    # storage-optimal solar share + real consumption per state, from the summary
     summary = pd.read_csv(results_dir / "usa_summary.csv")
     alpha_by_id = dict(zip(summary["region_id"].astype(int), summary["mix_alpha"]))
+    cons_by_id = dict(zip(summary["region_id"].astype(int),
+                          summary["annual_consumption_TWh"]))
+    feas_by_name = dict(zip(summary["name"], summary["feasible_1pct"]))
+    short_by_name = dict(zip(summary["name"], summary["mix_shortfall_TWh_1pct"]))
+    # each build's land footprint (% of state land) -> drives the per-cap supply lines
+    landpct = {src: dict(zip(summary["name"], summary[f"{src}_land_pct"]))
+               for src in ("solar", "wind", "mix")}
 
     # load only the US slice of the zonal table
     table = process.load_zonal(cfg)
     table = table[table["region_id"].isin(us_ids)]
     by_region = {int(rid): grp for rid, grp in table.groupby("region_id")}
 
+    spy = analyze.steps_per_year(cfg)
     items = {"solar": [], "wind": [], "mix": []}
     unmet_rows = []
     for _, r in us.iterrows():
@@ -124,6 +133,7 @@ def main() -> None:
         if rid not in by_region:
             log.warning("no zonal data for %s", r["name"]); continue
         name, alpha = r["name"], float(alpha_by_id.get(rid, np.nan))
+        cons = float(cons_by_id.get(rid, np.nan))     # real EIA consumption, TWh/yr
         cf_df = analyze.capacity_factors(by_region[rid], cfg)
         demand = deficit.make_demand(cfg, cf_df.index, tair=cf_df["tair"].to_numpy(),
                                      monthly=analyze.monthly_demand_profile(cfg, rid))
@@ -134,37 +144,39 @@ def main() -> None:
             series[src] = cf_df[src].to_numpy(float)
         for src in ("solar", "wind", "mix"):
             res = deficit.analyze_region(series[src], cf_df.index, demand,
-                                         cfg["storage"], analyze.steps_per_year(cfg),
-                                         simulate=True)
+                                         cfg["storage"], spy, simulate=True)
             if res.series is not None:
-                items[src].append((name, res))
+                items[src].append((name, res, cons))    # carry real consumption for TWh
 
-        # months-unmet table: mean-matched (unit-mean) sizing, no storage
-        row = {"name": name, "mix_alpha": round(alpha, 3)}
+        # months-unmet table: mean-matched (unit-mean) sizing, no storage; real TWh
+        row = {"name": name, "mix_alpha": round(alpha, 3),
+               "annual_consumption_TWh": round(cons, 2),
+               "feasible_1pct": feas_by_name.get(name),
+               "mix_annual_shortfall_TWh": round(float(short_by_name.get(name, 0.0)), 2)}
         for src in ("mix", "solar", "wind"):
             sup = series[src] / series[src].mean()    # enforce mean 1 exactly
-            n_unmet, n_tot, worst = months_unmet(sup, demand, cf_df.index)
-            tag = "mix" if src == "mix" else src
-            row[f"{tag}_months_unmet"] = n_unmet
+            n_unmet, n_tot, worst = months_unmet(sup, demand, cf_df.index, cons, spy)
+            row[f"{src}_months_unmet"] = n_unmet
             if src == "mix":
                 row["n_months_total"] = n_tot
-                row["mix_pct_months_unmet"] = round(100.0 * n_unmet / n_tot, 1)
-                row["mix_worst_month_shortfall_pct"] = round(worst, 1)
+                row["mix_worst_month_shortfall_TWh"] = round(worst, 2)
         unmet_rows.append(row)
-        log.info("processed %s (alpha=%.2f, mix unmet=%d)", name, alpha,
-                 row["mix_months_unmet"])
+        log.info("processed %s (alpha=%.2f, %.0f TWh/yr, mix unmet=%d/%d months)",
+                 name, alpha, cons, row["mix_months_unmet"], row["n_months_total"])
 
-    # ---- deficit/storage PDFs (solar, wind, optimal mix) ----
+    # ---- deficit/storage PDFs in real units (solar, wind, optimal mix) ----
     for src in ("solar", "wind", "mix"):
-        figures.deficit_pdf(figdir / f"deficit_{src}_{GROUP}.pdf",
-                            items[src], src, GROUP)
-        log.info("wrote deficit_%s_%s_{supply,storage}.pdf (%d states)",
+        # each resource's _normalized plot gets the unconstrained + per-cap supply lines,
+        # scaled by that resource's own demand-meeting land footprint.
+        figures.deficit_pdf_realunits(figdir / f"deficit_{src}_{GROUP}.pdf",
+                                      items[src], src, GROUP, spy, land_pct=landpct[src])
+        log.info("wrote deficit_%s_%s_{supply,storage,normalized}.pdf (%d states)",
                  src, GROUP, len(items[src]))
 
-    # ---- months-unmet table ----
-    cols = ["name", "mix_alpha", "n_months_total", "mix_months_unmet",
-            "mix_pct_months_unmet", "mix_worst_month_shortfall_pct",
-            "solar_months_unmet", "wind_months_unmet"]
+    # ---- months-unmet table (real units) ----
+    cols = ["name", "mix_alpha", "annual_consumption_TWh", "feasible_1pct",
+            "mix_annual_shortfall_TWh", "n_months_total", "mix_months_unmet",
+            "mix_worst_month_shortfall_TWh", "solar_months_unmet", "wind_months_unmet"]
     out = (pd.DataFrame(unmet_rows)[cols]
            .sort_values("mix_months_unmet", ascending=False)
            .reset_index(drop=True))

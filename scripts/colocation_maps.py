@@ -26,11 +26,13 @@ PRODUCTION (s_tot / f_adj at k=0) for the world/GLDAS run.
 Outputs:
   results/colocation_storage.csv          -- per region, the min storage at each k
       plus which technology won the overlap (kN_pick);
-  figures/map_colocation_feasibility.png  -- binary "sustainable (<= threshold)"
-      world maps, one column per overlap level (baseline + 17/35/50 %), one row
-      per storage threshold. For k > 0 a sustainable region is colored by which
-      technology the overlap was assigned to (wind vs solar); k = 0 uses a single
-      baseline color.
+  figures/map_colocation_feasibility.png  -- WORLD storage-threshold maps (default
+      path): binary "sustainable (<= threshold)", one column per overlap level
+      (baseline + 17/35/50 %), one row per storage threshold. For k > 0 a region is
+      colored by the overlap assignment (wind vs solar); k = 0 uses a baseline color.
+  figures/map_usa_colocation_feasibility.png -- USA land-feasibility maps written by
+      --land-feasibility (distinct filename so it never clobbers the world figure):
+      grid of rows = land cap (1/1.88/5 %), cols = overlap k.
 
 Usage:
   python scripts/colocation_maps.py [--config hpc/config_oscer.yaml]
@@ -54,7 +56,7 @@ import pandas as pd
 from matplotlib.patches import Patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from gldas_storage import analyze, deficit, process, qc
+from gldas_storage import analyze, deficit, landuse, process, qc
 from gldas_storage.config import load_config
 
 log = logging.getLogger(__name__)
@@ -130,6 +132,78 @@ def recompute(cfg: dict, regions: gpd.GeoDataFrame, summary: pd.DataFrame) -> pd
         if len(rows) % 100 == 0:
             log.info("  %d regions done", len(rows))
     return pd.DataFrame(rows).round(4)
+
+
+def land_feasibility(summary: pd.DataFrame) -> pd.DataFrame:
+    """USA real-units path: 'meets demand within the land cap' at each (cap, k).
+
+    Two variables sweep on a grid: the land-cap scenario (1% NREL, 1.88% = 2x onshore
+    oil & gas) and the co-location overlap k. Co-location lets the same footprint host
+    (1+k) generation, so the land the demand-meeting build needs shrinks by 1/(1+k):
+    land(k)=land(0)/(1+k); a region is feasible when land(k) <= cap. alpha*, f_adj, cf
+    and consumption are held fixed. Uses usa_summary.csv real-units columns (no recompute)."""
+    rows = []
+    for _, r in summary.iterrows():
+        row = {"region_id": int(r["region_id"]), "name": r["name"]}
+        for capkey, frac, _ in landuse.LAND_CAPS:
+            for k in K_LEVELS:
+                res = landuse.assess(
+                    alpha=float(r["mix_alpha"]), f_adj=float(r["mix_f_adj"]),
+                    solar_cf=float(r["solar_cf"]), wind_cf=float(r["wind_cf"]),
+                    annual_consumption_TWh=float(r["annual_consumption_TWh"]),
+                    state_area_km2=float(r["state_land_km2"]),
+                    s_tot_fraction=float(r["mix_s_tot_pct"]) / 100.0,
+                    land_overlap_k=k, land_fraction_cap=frac)
+                row[f"{capkey}_{kcol(k)}_feasible"] = bool(res.feasible)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def make_land_figure(gdf: gpd.GeoDataFrame, n: int, dataset: str, period: str,
+                     out: Path, bounds: dict) -> None:
+    """Grid of binary 'feasible within land cap' maps: rows = land cap, cols = overlap k."""
+    fail_c = "#d73027"          # red, matches map_usa_feasibility "needs > cap land"
+    caps = landuse.LAND_CAPS
+    nrow, ncol = len(caps), len(K_LEVELS)
+    fig = plt.figure(figsize=(4.6 * ncol, 3.6 * nrow + 1.0))
+    gs = fig.add_gridspec(nrow, ncol, hspace=0.12, wspace=0.03,
+                          left=0.05, right=0.99, top=0.84, bottom=0.02)
+    fig.suptitle("USA solar+wind feasibility vs. land cap and co-location overlap k\n"
+                 f"({dataset} {period}, real EIA consumption; co-location packs (1+k)× "
+                 "generation into the same footprint)", fontsize=14, weight="bold", y=0.99)
+    fig.legend(handles=[Patch(facecolor=BASE_C, label="feasible within land cap"),
+                        Patch(facecolor=fail_c, label="needs more land"),
+                        Patch(facecolor=NODATA_C, edgecolor="0.6", label="no data")],
+               loc="center", ncol=3, fontsize=11, frameon=True,
+               bbox_to_anchor=(0.5, 0.89))
+    for ri, (capkey, _, caplabel) in enumerate(caps):
+        base_cnt = int(gdf[f"{capkey}_{kcol(0.0)}_feasible"].fillna(False).sum())
+        for ci, k in enumerate(K_LEVELS):
+            ax = fig.add_subplot(gs[ri, ci])
+            feas = gdf[f"{capkey}_{kcol(k)}_feasible"]
+            valid = feas.notna()
+            _draw(ax, gdf[~valid], NODATA_C)
+            _draw(ax, gdf[valid & ~feas.fillna(False)], fail_c)
+            _draw(ax, gdf[valid & feas.fillna(False)], BASE_C)
+            cnt = int(feas.fillna(False).sum())
+            delta = "" if k == 0 else f"  (+{cnt - base_cnt})"
+            cnt_lab = f"{cnt}/{n} ({100*cnt/n:.0f}%){delta}"
+            if ri == 0:
+                klab = "no co-location" if k == 0 else f"{int(round(k*100))}% co-location"
+                ax.set_title(f"{klab}\n{cnt_lab}", fontsize=10)
+            else:
+                ax.set_title(cnt_lab, fontsize=9)
+            if ci == 0:
+                ax.set_ylabel(f"Land cap: {caplabel}", fontsize=11)
+            ax.set_xlim(*bounds["xlim"]); ax.set_ylim(*bounds["ylim"])
+            ax.set_xticks([]); ax.set_yticks([])
+            for s in ax.spines.values():
+                s.set_visible(False)
+    fig.savefig(out, dpi=200, bbox_inches="tight")
+    qc.report(fig=fig, name=out.name)
+    plt.close(fig)
+    qc.report(png_path=out, name=out.name)
+    log.info("wrote %s", out)
 
 
 def _draw(ax, sub, color):
@@ -208,6 +282,9 @@ def main() -> None:
                     help="EIA monthly-demand CSV; if given, demand profile is set to monthly (USA case)")
     ap.add_argument("--conus", action="store_true",
                     help="frame the maps on CONUS (for the USA / NLDAS run)")
+    ap.add_argument("--land-feasibility", action="store_true",
+                    help="USA real-units mode: map 'meets demand within <=1%% land' at "
+                         "each co-location k (uses usa_summary.csv real-units columns)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -218,6 +295,26 @@ def main() -> None:
     results_dir, figdir = cfg["paths"]["results_dir"], cfg["paths"]["figures_dir"]
     regions = gpd.read_file(cfg["paths"]["regions_gpkg"])
     summary = pd.read_csv(results_dir / args.summary)
+
+    short = cfg["gldas"]["short_name"]
+    dataset = "NLDAS" if "NLDAS" in short else "GLDAS" if "GLDAS" in short else short
+    period = f"{cfg['period']['start'][:4]}-{cfg['period']['end'][:4]}"
+
+    # ---- USA real-units land-feasibility path (no storage thresholds) ----
+    if args.land_feasibility:
+        land = land_feasibility(summary)
+        land.to_csv(results_dir / "colocation_land_feasibility.csv", index=False)
+        n = len(land)
+        for capkey, frac, caplabel in landuse.LAND_CAPS:
+            cnts = ", ".join(f"k={k:.2f}:{int(land[f'{capkey}_{kcol(k)}_feasible'].sum())}"
+                             for k in K_LEVELS)
+            log.info("  cap %s (%.2f%%): %s / %d states", caplabel, frac * 100, cnts, n)
+        gdf = regions.merge(land, on=["region_id", "name"], how="right")
+        bounds = {"xlim": (-126, -66), "ylim": (23, 50)}
+        # distinct filename -- must NOT clobber the world map_colocation_feasibility.png
+        make_land_figure(gdf, n, dataset, period,
+                         figdir / "map_usa_colocation_feasibility.png", bounds)
+        return
 
     csv = results_dir / "colocation_storage.csv"
     if args.no_recompute and csv.exists():
@@ -243,9 +340,6 @@ def main() -> None:
         log.info("  k=%.2f: %s", k,
                  ", ".join(f"≤{t:g}%:{int((c <= t).sum())}" for t in thresholds))
 
-    short = cfg["gldas"]["short_name"]
-    dataset = "NLDAS" if "NLDAS" in short else "GLDAS" if "GLDAS" in short else short
-    period = f"{cfg['period']['start'][:4]}-{cfg['period']['end'][:4]}"
     # rename the basis-appropriate columns to the bare kcol() the figure expects
     rename = {f"{kcol(k)}_{suffix}": kcol(k) for k in K_LEVELS}
     pickcols = [f"{kcol(k)}_pick" for k in K_LEVELS]

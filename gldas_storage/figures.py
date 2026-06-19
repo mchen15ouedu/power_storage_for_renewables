@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 
-from . import analyze, deficit, process
+from . import analyze, deficit, landuse, process
 
 log = logging.getLogger(__name__)
 
@@ -194,6 +194,126 @@ def deficit_pdf(path, items: list[tuple[str, deficit.RegionResult]], source: str
             ax2.set_ylabel("Storage [%]", fontsize=7, color="red")
             ax2.tick_params(labelsize=6, colors="red")
             ax.set_title(title, fontsize=9)
+            ax.tick_params(labelsize=6)
+
+
+def deficit_pdf_realunits(path, items, source: str, group_name: str,
+                          steps_per_year: int, land_pct: dict | None = None) -> None:
+    """USA real-units deficit family (TWh). No fractions -- everything physical.
+
+    ``items``: list of (name, RegionResult, annual_consumption_TWh). The normalized
+    series (demand mean 1; deficit/storage in fraction of annual consumption) are
+    rescaled with that state's real EIA consumption:
+       monthly energy [TWh] = sum_over_month( series * cons_TWh / steps_per_year )
+       deficit/storage [TWh] = series * cons_TWh
+    Three PDFs:
+       _supply.pdf      monthly supply vs demand, TWh
+       _storage.pdf     cumulative deficit + storage state, TWh
+       _normalized.pdf  supply & demand each / that month's EIA consumption
+                        (demand -> 1.0 reference; supply -> fraction of demand met).
+                        When ``land_pct`` (name -> footprint % of state land for the
+                        demand-meeting build) is given, the supply is drawn FOUR times
+                        -- unconstrained plus scaled to fit each land cap in
+                        ``landuse.LAND_CAPS`` (cap_scale = min(1, cap% / land%)). For a
+                        state already within a cap all four coincide; a land-constrained
+                        state shows the tighter caps dip below the 1.0 demand line.
+    """
+    region_label = group_name.replace("_", " ")
+
+    # supply lines for the _normalized plot: unconstrained build + one per land cap
+    # (tightest cap last so it draws on top). cap_scale shrinks the whole build.
+    cap_lines = [(None, "no land cap", "#1a9850")]
+    cap_palette = {"oilgas_all": "#74add1", "oilgas2x": "#fdae61", "1pct": "#d73027"}
+    for key, frac, _label in reversed(landuse.LAND_CAPS):     # 5% -> 1.88% -> 1%
+        cap_lines.append((frac, f"≤{frac*100:g}% land", cap_palette.get(key, "0.4")))
+
+    def monthly_twh(series: pd.Series, cons_twh: float) -> pd.Series:
+        return (series * cons_twh / steps_per_year).resample("MS").sum()
+
+    with PdfPages(path.with_name(path.stem + "_supply.pdf")) as pdf:
+        capped_s = land_pct is not None
+        s_legend = [(c, 1.0, f"Supply ({lbl}) [TWh]") for frac, lbl, c in cap_lines] \
+            if capped_s else [("green", 1.0, "Monthly supply [TWh]")]
+        s_legend.append(("black", 1.0, "Monthly demand = EIA consumption [TWh]"))
+        s_note = ("Real monthly energy. Supply is the optimal build (storage-sized); "
+                  "where it dips below the black demand that month is short of energy.")
+        if capped_s:
+            s_note += (" Supply is shown unconstrained (green) and scaled to fit each "
+                       "land cap (cap_scale = min(1, cap% / build-footprint%)); a "
+                       "land-constrained state's tighter caps fall below demand.")
+        _legend_page(
+            pdf, f"{source.title()} supply vs. demand in real units (TWh)\n{region_label}",
+            s_legend, note=s_note)
+        for ax, (title, res, cons) in zip(_page_iter(pdf, len(items)), items):
+            sup = monthly_twh(res.series["supply"], cons)
+            dem = monthly_twh(res.series["demand"], cons)
+            lp = land_pct.get(title) if capped_s else None
+            if lp and lp > 0:
+                for frac, lbl, color in cap_lines:
+                    scale = 1.0 if frac is None else min(1.0, frac * 100.0 / lp)
+                    ax.plot(sup.index, (sup * scale).values, color=color, lw=0.6)
+                ax.set_title(f"{title} ({cons:.0f} TWh/yr, {lp:.1f}% land)", fontsize=9)
+            else:
+                ax.plot(sup.index, sup.values, color="green", lw=0.5)
+                ax.set_title(f"{title} ({cons:.0f} TWh/yr)", fontsize=9)
+            ax.plot(dem.index, dem.values, color="black", lw=0.8)
+            ax.set_xlabel("Date", fontsize=7)
+            ax.set_ylabel("Energy [TWh/month]", fontsize=7)
+            ax.tick_params(labelsize=6)
+
+    with PdfPages(path.with_name(path.stem + "_storage.pdf")) as pdf:
+        _legend_page(
+            pdf, f"Cumulative deficit and storage state in TWh ({source})\n{region_label}",
+            [("blue", 1.0, "Cumulative deficit [TWh] -- left axis"),
+             ("red", 1.0, "Storage state [TWh] -- right axis")],
+            note="Deficit (blue) is running unmet demand; the store (red) starts full "
+                 "and is drawn down to cover it. Both in real TWh (scaled by EIA "
+                 "consumption). Peak deficit = required storage capacity.")
+        for ax, (title, res, cons) in zip(_page_iter(pdf, len(items)), items):
+            s = res.series.resample("1D").mean()
+            ax.plot(s.index, s["deficit"] * cons, color="blue", lw=0.5)
+            ax.set_ylabel("Deficit [TWh]", fontsize=7, color="blue")
+            ax.set_xlabel("Date", fontsize=7)
+            ax2 = ax.twinx()
+            ax2.plot(s.index, s["storage"] * cons, color="red", lw=0.5)
+            ax2.set_ylabel("Storage [TWh]", fontsize=7, color="red")
+            ax2.tick_params(labelsize=6, colors="red")
+            ax.set_title(f"{title} (cap {res.s_tot*cons:.1f} TWh)", fontsize=9)
+            ax.tick_params(labelsize=6)
+
+    with PdfPages(path.with_name(path.stem + "_normalized.pdf")) as pdf:
+        capped = land_pct is not None
+        legend = [(c, 1.0, f"Supply ({lbl}) / consumption") for frac, lbl, c in cap_lines] \
+            if capped else [("green", 1.0, "Supply / that month's consumption")]
+        legend.append(("black", 1.0, "Demand / consumption = 1.0 reference"))
+        note = ("Each series is divided by that month's EIA consumption, so demand is a "
+                "flat 1.0 line and supply reads as the fraction of that month's demand "
+                "met (above 1 = surplus, below 1 = deficit).")
+        if capped:
+            note += (" Supply is shown unconstrained (green) and scaled to fit each land "
+                     "cap (cap_scale = min(1, cap% / build-footprint%)); for a state "
+                     "within a cap the lines coincide, otherwise the tighter caps dip "
+                     "below 1.0 -- an energy deficit storage cannot fix.")
+        _legend_page(
+            pdf, f"{source.title()} supply & demand normalized by monthly EIA "
+                 f"consumption\n{region_label}", legend, note=note)
+        for ax, (title, res, cons) in zip(_page_iter(pdf, len(items)), items):
+            sup = monthly_twh(res.series["supply"], cons)
+            dem = monthly_twh(res.series["demand"], cons)
+            denom = dem.where(dem > 0)
+            ax.axhline(1.0, color="black", lw=0.8)
+            lp = land_pct.get(title) if capped else None
+            if lp and lp > 0:
+                for frac, lbl, color in cap_lines:
+                    scale = 1.0 if frac is None else min(1.0, frac * 100.0 / lp)
+                    ax.plot((sup * scale / denom).index, (sup * scale / denom).values,
+                            color=color, lw=0.6)
+                ax.set_title(f"{title} ({lp:.1f}% land)", fontsize=9)
+            else:
+                ax.plot((sup / denom).index, (sup / denom).values, color="green", lw=0.5)
+                ax.set_title(title, fontsize=9)
+            ax.set_xlabel("Date", fontsize=7)
+            ax.set_ylabel("Supply / monthly demand", fontsize=7)
             ax.tick_params(labelsize=6)
 
 

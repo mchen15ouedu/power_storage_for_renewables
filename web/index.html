@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Solar + Wind Storage Atlas</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+<div id="app">
+  <button id="sidebarReopen" class="panel-reopen" title="Show panel">☰ Panel</button>
+  <button id="detailReopen" class="detail-reopen" title="Show region details">‹ Details</button>
+
+  <aside id="sidebar">
+    <button id="sidebarCollapse" class="panel-toggle" title="Collapse panel">« Hide</button>
+    <header>
+      <span class="wip-badge">⚗ Ongoing · unpublished work</span>
+      <h1>Solar&nbsp;+&nbsp;Wind<br>Storage Atlas</h1>
+      <p class="sub" id="subtitle">Local storage &amp; land for 100% solar+wind self-sufficiency</p>
+    </header>
+
+    <section class="control">
+      <label class="ctl-label">Color regions by</label>
+      <select id="metricSelect"></select>
+      <div id="legend" class="legend"></div>
+    </section>
+
+    <section class="control">
+      <label class="ctl-label">Find a region</label>
+      <input id="search" type="text" placeholder="Type a state / country…" autocomplete="off" />
+      <ul id="searchResults"></ul>
+    </section>
+
+    <section class="control note" id="intro">
+      <p>Click any region on the map to see its storage requirement, capacity factors,
+      and supply-vs-demand charts. The <b>optimal mix</b> is the solar/wind blend that
+      minimizes storage. USA states also carry <b>real-units</b> results
+      (TWh, nameplate GW, land-use feasibility) driven by real EIA consumption.</p>
+      <p class="wip-note"><b>Note:</b> preliminary output from ongoing, unpublished research —
+      methods and numbers may still change. Please do not cite without permission.</p>
+    </section>
+
+    <section class="control" id="downloads">
+      <label class="ctl-label">Download data</label>
+      <div id="dlLinks" class="dl-links"></div>
+    </section>
+
+    <footer id="meta-foot"></footer>
+
+    <section class="ou-claim">
+      <label class="ctl-label">Copyright statement</label>
+      <p>The documents and materials to which this notice is attached is protected by copyright
+      owned in whole or in principal part by the University of Oklahoma Board of Regents and the
+      state of Oklahoma. You may download the document for reference and research purposes only.</p>
+      <p>Distribution and/or alteration by not-for-profit research or educational institutions for
+      their local use is permitted as long as this notice is kept intact and attached to the
+      document. Any other distribution of copies of the document or any altered version there of is
+      expressly prohibited without prior written consent of the University.</p>
+    </section>
+  </aside>
+
+  <main id="map"></main>
+
+  <section id="detail" class="hidden">
+    <button id="closeDetail" title="Collapse details">×</button>
+    <div id="detailHead">
+      <h2 id="rName">—</h2>
+      <div id="rCrumb" class="crumb"></div>
+      <div id="rLinks" class="links"></div>
+    </div>
+
+    <div id="dsTabs" class="ds-tabs hidden">
+      <button class="ds-tab active" data-ds="gldas">GLDAS · theoretical</button>
+      <button class="ds-tab" data-ds="nldas">NLDAS-USA · EIA</button>
+    </div>
+
+    <div id="detailBody"></div>
+  </section>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

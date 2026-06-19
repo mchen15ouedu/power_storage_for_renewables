@@ -41,14 +41,14 @@ CFG="${REPO}/hpc/config_nldas.yaml"
 # with backoff and only relocate after sustained failure (a real bad node).
 NODE=$(hostname -s); BADFILE="${REPO}/hpc/bad_nodes.txt"
 ENV_OK=0; ENV_ERR=""
-for t in 1 2 3 4 5; do
+for t in 1 2 3 4 5 6 7 8; do
     conda activate geo2 2>/dev/null || true
     if ENV_ERR=$(python -c "import geopandas, pyarrow, xarray" 2>&1); then ENV_OK=1; break; fi
-    echo "nldas_usa: env check ${t}/5 on ${NODE} failed: ${ENV_ERR}" >&2
+    echo "nldas_usa: env check ${t}/8 on ${NODE} failed: ${ENV_ERR}" >&2
     sleep $((t * 5))
 done
 if [ "${ENV_OK}" -ne 1 ]; then
-    echo "nldas_usa: ENV BROKEN on ${NODE} after 5 tries -- relocating" >&2
+    echo "nldas_usa: ENV BROKEN on ${NODE} after 8 tries -- relocating" >&2
     printf '%s\t%s\tjob=%s\t%s\n' \
         "$(date -u +%FT%TZ)" "${NODE}" "${SLURM_JOB_ID:-?}" "${ENV_ERR//$'\n'/ }" >> "${BADFILE}"
     EXCL=$(awk -F'\t' 'NF>1{print $2}' "${BADFILE}" | sort -u | paste -sd, -)

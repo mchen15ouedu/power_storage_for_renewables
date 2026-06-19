@@ -24,3 +24,4 @@ logs/
 hpc/edl_token.txt
 *.edl_token
 .pytest_cache/
+hpc/bad_nodes.txt

@@ -27,8 +27,22 @@ conda activate geo2
 set -u
 
 REPO=${HOME}/gldas_storage
+SELF="${REPO}/hpc/oscer_qcagent.sbatch"
 
+# ENV GUARD: if geo2 didn't load on this node, the QCagent itself would crash.
+# Record the node and relaunch the QCagent excluding all bad nodes seen.
+NODE=$(hostname -s); BADFILE="${REPO}/hpc/bad_nodes.txt"
+if ! python -c "import geopandas, pyarrow, xarray" 2>/dev/null; then
+    echo "QCagent: ENV BROKEN on ${NODE} -- relocating" >&2
+    printf '%s\t%s\tjob=%s\tQCagent env failed\n' \
+        "$(date -u +%FT%TZ)" "${NODE}" "${SLURM_JOB_ID:-?}" >> "${BADFILE}"
+    EXCL=$(awk -F'\t' 'NF>1{print $2}' "${BADFILE}" | sort -u | paste -sd, -)
+    sbatch --exclude="${EXCL}" "${SELF}" || sbatch "${SELF}"
+    exit 0
+fi
+
+# run unbounded on caps_rcm (no wall-clock cap) so it babysits the whole campaign
 python "${REPO}/scripts/qc_agent.py" \
     --config "${REPO}/hpc/config_nldas.yaml" \
     --sbatch "${REPO}/hpc/oscer_nldas_zonal.sbatch" \
-    --interval 600 --stall-min 90 --max-hours 120
+    --interval 600 --stall-min 90 --max-hours 100000

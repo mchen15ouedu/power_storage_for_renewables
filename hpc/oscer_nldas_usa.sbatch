@@ -36,6 +36,18 @@ set -u
 REPO=${HOME}/gldas_storage
 CFG="${REPO}/hpc/config_nldas.yaml"
 
+# ENV GUARD: relocate off a node where geo2 failed to load (would crash analysis)
+NODE=$(hostname -s); BADFILE="${REPO}/hpc/bad_nodes.txt"
+if ! python -c "import geopandas, pyarrow, xarray" 2>/dev/null; then
+    echo "nldas_usa: ENV BROKEN on ${NODE} -- relocating" >&2
+    printf '%s\t%s\tjob=%s\tnldas_usa env failed\n' \
+        "$(date -u +%FT%TZ)" "${NODE}" "${SLURM_JOB_ID:-?}" >> "${BADFILE}"
+    EXCL=$(awk -F'\t' 'NF>1{print $2}' "${BADFILE}" | sort -u | paste -sd, -)
+    sbatch --exclude="${EXCL}" "${REPO}/hpc/oscer_nldas_usa.sbatch" \
+        || sbatch "${REPO}/hpc/oscer_nldas_usa.sbatch"
+    exit 0
+fi
+
 # guard: refuse to run if no zonal parquet exists yet
 N_PARQUET=$(find /ourdisk/hpc/caps/mchen15/nldas_full -name 'zonal_*.parquet' 2>/dev/null | wc -l)
 echo "NLDAS zonal parquet files present: ${N_PARQUET}"

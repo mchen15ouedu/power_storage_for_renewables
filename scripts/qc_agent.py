@@ -69,6 +69,31 @@ def years_done(cfg: dict, years: range) -> dict[int, bool]:
     return done
 
 
+def parquet_count(cfg: dict, year: int) -> int:
+    return len(list(cfg["paths"]["zonal_dir"].glob(f"zonal_{year}*.parquet")))
+
+
+def bad_nodes() -> list[str]:
+    """Distinct compute nodes that failed the env guard (geo2 not active), from
+    hpc/bad_nodes.txt -- surfaced so the user can report them to OSCER."""
+    f = REPO / "hpc" / "bad_nodes.txt"
+    if not f.exists():
+        return []
+    return sorted({ln.split("\t")[1] for ln in f.read_text().splitlines()
+                   if "\t" in ln and len(ln.split("\t")) > 1})
+
+
+def write_status(cfg: dict, **kv) -> None:
+    """Heartbeat the QCagent's state to results/qcagent_status.json so an external
+    monitor (the caps_rcm Claude watcher) can tell if it is healthy or stuck."""
+    import json
+    out = cfg["paths"]["results_dir"] / "qcagent_status.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    kv["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    kv["bad_nodes"] = bad_nodes()
+    out.write_text(json.dumps(kv, indent=2))
+
+
 def _expand_array_indices(field: str) -> set[int]:
     """Expand a squeue %K array-index field into the set of year indices.
 
@@ -218,6 +243,8 @@ def main() -> None:
     years = range(int(cfg["period"]["start"][:4]), int(cfg["period"]["end"][:4]) + 1)
     resubmits = {y: 0 for y in years}
     last_count = {y: (-1, time.monotonic()) for y in years}   # (raw_count, time first seen at this count)
+    last_pq = {y: parquet_count(cfg, y) for y in years}       # reduction progress (zonal parquets)
+    gave_up: set[int] = set()
     deadline = time.monotonic() + args.max_hours * 3600
 
     while True:
@@ -227,14 +254,28 @@ def main() -> None:
         running_now = {y for y, s in states.items() if s == "RUNNING"}
         up = server_up()
         n_done = sum(done.values())
-        log.info("cycle: %d/%d complete | running=%s | pending=%d | GES DISC %s",
+        log.info("cycle: %d/%d complete | running=%s | pending=%d | gave_up=%s | GES DISC %s",
                  n_done, len(years), sorted(running_now),
-                 len(queued) - len(running_now), "up" if up else "DOWN")
+                 len(queued) - len(running_now), sorted(gave_up) or "none", "up" if up else "DOWN")
+        write_status(cfg, years_done=n_done, years_total=len(years),
+                     running=sorted(running_now), pending=len(queued) - len(running_now),
+                     gave_up=sorted(gave_up), server_up=up,
+                     resubmits={y: c for y, c in resubmits.items() if c})
 
         if n_done < len(years) and up:
             for y in years:
                 if done[y]:
                     continue
+                # reduction progress => the sbatch is self-healing (e.g. excluded a
+                # bad node and reran); clear the give-up state and resubmit budget.
+                pq = parquet_count(cfg, y)
+                if pq > last_pq[y]:
+                    last_pq[y] = pq
+                    if resubmits[y] or y in gave_up:
+                        log.info("year %d progressed to %d/12 parquets -- resetting "
+                                 "resubmit budget", y, pq)
+                    resubmits[y] = 0
+                    gave_up.discard(y)
                 if y not in queued:
                     # genuinely gone from the queue (its job died) -> resubmit
                     if resubmits[y] < MAX_RESUBMITS:
@@ -242,9 +283,11 @@ def main() -> None:
                         log.warning("year %d incomplete and not queued -- resubmitting "
                                     "(#%d)", y, resubmits[y])
                         resubmit(sbatch, y, args.dry_run)
-                    else:
-                        log.error("year %d still incomplete after %d resubmits -- giving up",
-                                  y, MAX_RESUBMITS)
+                    elif y not in gave_up:
+                        gave_up.add(y)         # log ONCE, not every cycle
+                        log.error("year %d incomplete after %d resubmits -- giving up. "
+                                  "bad nodes so far: %s", y, MAX_RESUBMITS,
+                                  bad_nodes() or "none recorded")
                     continue
                 if y not in running_now:
                     # PENDING behind the array's %N throttle -- 0 raw files is

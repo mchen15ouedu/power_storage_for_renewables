@@ -5,7 +5,14 @@
 #       wget appends %0D to every URL and gets an HTML error page)
 #   2. wget them into /scratch/mchen15/nldas/raw/<YEAR>/
 #   3. reduce to HOURLY zonal means (monthly parquet) on /ourdisk
-#   4. delete the year's raw granules from scratch
+#   4. ALSO reduce to per-pixel per-year CF (optimal-siting layer)
+#   5. KEEP the raw granules on /scratch (it auto-purges after 14 days; we reuse
+#      the raw within that window for the per-pixel layer and other analyses --
+#      NEVER rm the raw, that is what deleted 24 years' data before).
+#
+# ENV GUARD: some nodes silently fail `conda activate geo2` and run base python
+# (no geopandas) -> the reduction crashes AFTER a full download. We detect that,
+# log the node to hpc/bad_nodes.txt (report to OSCER), and resubmit excluding it.
 #
 # NLDAS_FORA0125_H v2.0: hourly, 0.125 deg, CONUS only. ~8760 granules/year.
 #
@@ -38,9 +45,27 @@ set -u
 
 YEAR=${SLURM_ARRAY_TASK_ID}
 REPO=${HOME}/gldas_storage
+SELF="${REPO}/hpc/oscer_nldas_zonal.sbatch"     # $0 is the spool copy; hardcode for resubmit
 LIST=/scratch/mchen15/nldas/nldas_list.txt
 RAW=/scratch/mchen15/nldas/raw/${YEAR}
 mkdir -p "${RAW}"
+
+# --- ENV GUARD: verify geo2 actually loaded on THIS node (else base python has no
+#     geopandas and the reduction would crash after a full download). On failure,
+#     record the node for an OSCER report and resubmit EXCLUDING all bad nodes. ---
+NODE=$(hostname -s)
+BADFILE="${REPO}/hpc/bad_nodes.txt"
+if ! python -c "import geopandas, pyarrow, xarray" 2>/dev/null; then
+    echo "${YEAR}: ENV BROKEN on ${NODE} -- geo2 not active (geopandas/pyarrow/xarray missing)" >&2
+    printf '%s\t%s\tyear=%s\tjob=%s\tgeo2 import failed\n' \
+        "$(date -u +%FT%TZ)" "${NODE}" "${YEAR}" "${SLURM_JOB_ID:-?}" >> "${BADFILE}"
+    EXCL=$(awk -F'\t' 'NF>1{print $2}' "${BADFILE}" | sort -u | paste -sd, -)
+    echo "${YEAR}: resubmitting --exclude=${EXCL}" >&2
+    sbatch --array="${YEAR}" --exclude="${EXCL}" "${SELF}" \
+        || sbatch --array="${YEAR}" "${SELF}"
+    exit 0
+fi
+echo "${YEAR}: env OK on ${NODE}"
 
 # --- Earthdata Login bearer token (GES DISC token-based authorization) ------
 TOKEN_FILE="${EARTHDATA_TOKEN_FILE:-$HOME/.edl_token}"
@@ -83,10 +108,11 @@ python "${REPO}/scripts/01_zonal.py" \
     --config "${REPO}/hpc/config_nldas.yaml" \
     --start "${YEAR}-01-01" --end "${YEAR}-12-31"
 
-# --- 4: free the scratch space (only if the download was complete) ----------
-if [ "${N_FILES}" -ge "${N_URLS}" ]; then
-    rm -rf "${RAW}"
-    echo "${YEAR}: raw granules deleted"
-else
-    echo "${YEAR}: keeping raw folder for inspection (incomplete download)" >&2
-fi
+# --- 4: per-pixel per-year CF (optimal-siting layer), from the same download --
+python "${REPO}/scripts/nldas_pixel_reduce.py" \
+    --config "${REPO}/hpc/config_nldas.yaml" --year "${YEAR}"
+
+# --- 5: KEEP the raw on /scratch (auto-purges in 14 days) --------------------
+# Never `rm -rf` the raw: it is reused for the per-pixel layer and other analyses
+# within the 14-day scratch window. The /scratch policy reclaims the space itself.
+echo "${YEAR}: done (zonal + pixel); raw kept on scratch (auto-purge in ~14 days)"

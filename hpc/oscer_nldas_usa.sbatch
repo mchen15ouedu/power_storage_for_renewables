@@ -27,22 +27,26 @@
 set -euo pipefail
 mkdir -p logs
 
-module load Anaconda3/2022.05 2>/dev/null || true
+# Use geo2 DIRECTLY -- no `module load Anaconda3`, no `conda activate`. That
+# activation was the flaky step (transient "ModuleNotFoundError" on cold nodes that
+# stormed bad_nodes). geo2 lives on shared storage reachable from every node, so we
+# just point PATH + GDAL/PROJ/GLIB data dirs straight at it (what `conda activate`
+# would set, minus the flaky machinery).
 set +u
-source /opt/oscer/software/Anaconda3/2022.05/etc/profile.d/conda.sh
-conda activate geo2 || true     # transient activation failures handled by the retry guard
-# keep nounset OFF through the guard (conda's activate.d scripts read unset vars,
-# and set -e on an unprotected `conda activate` is what aborted jobs at 0 bytes)
+GEO2="${HOME}/.conda/envs/geo2"
+export PATH="${GEO2}/bin:${PATH}"
+export GDAL_DATA="${GEO2}/share/gdal"
+export PROJ_DATA="${GEO2}/share/proj"
+export GSETTINGS_SCHEMA_DIR="${GEO2}/share/glib-2.0/schemas"
 
 REPO=${HOME}/gldas_storage
 CFG="${REPO}/hpc/config_nldas.yaml"
 
-# ENV GUARD (RETRY): the first import on a cold node can fail transiently; retry
-# with backoff and only relocate after sustained failure (a real bad node).
+# ENV CHECK: retry only for cold-node shared-lib warmup (no conda activate to fail);
+# relocate only on a genuinely broken node (should essentially never trigger now).
 NODE=$(hostname -s); BADFILE="${REPO}/hpc/bad_nodes.txt"
 ENV_OK=0; ENV_ERR=""
 for t in 1 2 3 4 5 6 7 8; do
-    conda activate geo2 2>/dev/null || true
     if ENV_ERR=$(python -c "import geopandas, pyarrow, xarray" 2>&1); then ENV_OK=1; break; fi
     echo "nldas_usa: env check ${t}/8 on ${NODE} failed: ${ENV_ERR}" >&2
     sleep $((t * 5))

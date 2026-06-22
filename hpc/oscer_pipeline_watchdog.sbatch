@@ -25,11 +25,13 @@ set -uo pipefail
 cd "${HOME}/gldas_storage"
 mkdir -p logs
 
-module load Anaconda3/2022.05 2>/dev/null || true
+# Use geo2 DIRECTLY -- no `module load` / `conda activate` (the flaky step).
 set +u
-source /opt/oscer/software/Anaconda3/2022.05/etc/profile.d/conda.sh
-conda activate geo2 || true     # transient activation failures handled by the retry guard
-export PATH="${HOME}/.local/bin:${PATH}"        # for the opt-in claude escalation
+GEO2="${HOME}/.conda/envs/geo2"
+export PATH="${GEO2}/bin:${HOME}/.local/bin:${PATH}"   # geo2 + claude CLI
+export GDAL_DATA="${GEO2}/share/gdal"
+export PROJ_DATA="${GEO2}/share/proj"
+export GSETTINGS_SCHEMA_DIR="${GEO2}/share/glib-2.0/schemas"
 
 REPO="${HOME}/gldas_storage"
 SELF="${REPO}/hpc/oscer_pipeline_watchdog.sbatch"
@@ -38,7 +40,6 @@ NODE=$(hostname -s); BADFILE="${REPO}/hpc/bad_nodes.txt"
 # ENV GUARD (RETRY): retry before relocating (transient cold-start import failures).
 ENV_OK=0; ENV_ERR=""
 for t in 1 2 3 4 5 6 7 8; do
-    conda activate geo2 2>/dev/null || true
     if ENV_ERR=$(python -c "import yaml, pandas" 2>&1); then ENV_OK=1; break; fi
     echo "watchdog: env check ${t}/8 on ${NODE} failed: ${ENV_ERR}" >&2
     sleep $((t * 5))

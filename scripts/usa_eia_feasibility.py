@@ -249,6 +249,7 @@ def main() -> None:
 
     cfg = load_config(args.config)
     results_dir, figdir = Path(cfg["paths"]["results_dir"]), Path(cfg["paths"]["figures_dir"])
+    P = f"{cfg['usa_tag']}_" if cfg.get("usa_tag") else ""   # output prefix (e.g. "nldas_")
     regions = gpd.read_file(cfg["paths"]["regions_gpkg"])
     us = regions[(regions["country"] == "United States of America") &
                  (regions["level"] == "admin1")].copy()
@@ -266,7 +267,7 @@ def main() -> None:
     ann_twh = annual_consumption_twh(monthly_csv)
     areas = landuse.state_areas_km2(us)
 
-    summary_path = results_dir / "usa_summary.csv"
+    summary_path = results_dir / f"{P}usa_summary.csv"
     if args.no_analysis and summary_path.exists():
         summary = pd.read_csv(summary_path)
     else:
@@ -286,7 +287,7 @@ def main() -> None:
         "mix_shortfall_TWh_1pct", ascending=False)
     cols = ["name", "annual_consumption_TWh", "mix_land_pct"] + \
         [f"mix_shortfall_TWh_{k}" for k, _, _ in caps]
-    short[cols].round(3).to_csv(results_dir / "usa_cannot_meet_demand.csv", index=False)
+    short[cols].round(3).to_csv(results_dir / f"{P}usa_cannot_meet_demand.csv", index=False)
 
     def recovering_cap(row):
         for k, frac, _ in caps:
@@ -311,7 +312,7 @@ def main() -> None:
     rank.insert(0, "rank", rank.index + 1)
     rank[["rank", "name", "mix_alpha", "annual_consumption_TWh", "mix_storage_TWh_1pct",
           "mix_land_pct", "feasible_1pct", "feasible_oilgas2x", "mix_shortfall_TWh_1pct"]
-         ].round(4).to_csv(results_dir / "usa_storage_ranking.csv", index=False)
+         ].round(4).to_csv(results_dir / f"{P}usa_storage_ranking.csv", index=False)
 
     gdf = us.merge(summary, on=["region_id", "name"], how="left")
     n = int(summary["feasible_1pct"].notna().sum())
@@ -321,7 +322,7 @@ def main() -> None:
     dataset = str(cfg["gldas"]["short_name"]).split("_")[0]
     period = f"{str(cfg['period']['start'])[:4]}-{str(cfg['period']['end'])[:4]}"
     make_figure(gdf, counts, n,
-                figdir / "map_usa_feasibility.png", dataset, period)
+                figdir / f"map_{P}usa_feasibility.png", dataset, period)
     log.info("feasible: %s (of %d); cannot meet @1%%: %d",
              ", ".join(f"{c[3]}@{c[2]*100:g}%" for c in counts), n, n_short)
 

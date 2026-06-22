@@ -79,7 +79,8 @@ def main() -> None:
 
     cfg = load_config(args.config)
     rdir, figdir = Path(cfg["paths"]["results_dir"]), Path(cfg["paths"]["figures_dir"])
-    sit = pd.read_csv(rdir / "usa_pixel_siting.csv")
+    P = f"{cfg['usa_tag']}_" if cfg.get("usa_tag") else ""    # e.g. "nldas_"
+    sit = pd.read_csv(rdir / f"{P}usa_pixel_siting.csv")
 
     g = gpd.read_file(args.regions_gpkg)
     us = g[(g["country"] == "United States of America") & (g["level"] == "admin1")].copy()
@@ -114,7 +115,7 @@ def main() -> None:
     fig.suptitle("USA optimal-siting land use vs demand growth — best resource per NLDAS grid cell,\n"
                  "worst-year reliable, 1%/1.88%/5% land caps (1× / 1.14× / 1.25× EIA demand)",
                  fontsize=13, y=0.97)
-    dest = figdir / "map_usa_siting_landcaps.png"
+    dest = figdir / f"map_{P}usa_siting_landcaps.png"
     dest.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(dest, dpi=130, bbox_inches="tight")
     log.info("wrote %s", dest)

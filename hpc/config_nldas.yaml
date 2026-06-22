@@ -9,6 +9,12 @@
 # Wind is delivered as eastward/northward components, so wind10 is derived as
 # the speed sqrt(Wind_E^2 + Wind_N^2) in the zonal reduction.
 
+# Tag prepended to every USA output (results + figures, zonal AND pixel) so the
+# NLDAS products never collide with the GLDAS ones: e.g. nldas_usa_summary.csv,
+# map_nldas_usa_*.png, deficit_*_NLDAS_USA_states_*.pdf, nldas_usa_pixel_siting.csv.
+# GLDAS (config_oscer) leaves this unset, keeping its current untagged filenames.
+usa_tag: nldas
+
 paths:
   data_dir:    /ourdisk/hpc/caps/mchen15/nldas_analysis/data
   raw_dir:     /scratch/mchen15/nldas/raw

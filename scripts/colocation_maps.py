@@ -293,6 +293,7 @@ def main() -> None:
         cfg["demand"]["profile"] = "monthly"
         cfg["demand"]["monthly_csv"] = str(args.monthly_csv)
     results_dir, figdir = cfg["paths"]["results_dir"], cfg["paths"]["figures_dir"]
+    P = f"{cfg['usa_tag']}_" if cfg.get("usa_tag") else ""    # USA output prefix, e.g. "nldas_"
     regions = gpd.read_file(cfg["paths"]["regions_gpkg"])
     summary = pd.read_csv(results_dir / args.summary)
 
@@ -303,7 +304,7 @@ def main() -> None:
     # ---- USA real-units land-feasibility path (no storage thresholds) ----
     if args.land_feasibility:
         land = land_feasibility(summary)
-        land.to_csv(results_dir / "colocation_land_feasibility.csv", index=False)
+        land.to_csv(results_dir / f"{P}colocation_land_feasibility.csv", index=False)
         n = len(land)
         for capkey, frac, caplabel in landuse.LAND_CAPS:
             cnts = ", ".join(f"k={k:.2f}:{int(land[f'{capkey}_{kcol(k)}_feasible'].sum())}"
@@ -313,7 +314,7 @@ def main() -> None:
         bounds = {"xlim": (-126, -66), "ylim": (23, 50)}
         # distinct filename -- must NOT clobber the world map_colocation_feasibility.png
         make_land_figure(gdf, n, dataset, period,
-                         figdir / "map_usa_colocation_feasibility.png", bounds)
+                         figdir / f"map_{P}usa_colocation_feasibility.png", bounds)
         return
 
     csv = results_dir / "colocation_storage.csv"

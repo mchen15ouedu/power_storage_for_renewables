@@ -282,7 +282,8 @@ def load_nldas_usa(nldas_cfg_path: Path, spy_gldas: int):
     NAME (NLDAS uses its own region_id numbering). Returns {} when the run is absent."""
     nl_cfg = load_config(nldas_cfg_path)
     rdir = Path(nl_cfg["paths"]["results_dir"])
-    fsum = rdir / "usa_summary.csv"
+    P = f"{nl_cfg['usa_tag']}_" if nl_cfg.get("usa_tag") else ""   # NLDAS outputs are tagged
+    fsum = rdir / f"{P}usa_summary.csv"
     if not fsum.exists():
         return {}
     usa = dedupe_dot1(pd.read_csv(fsum))

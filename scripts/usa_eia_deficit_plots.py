@@ -91,6 +91,9 @@ def main() -> None:
 
     cfg = load_config(args.config)
     results_dir, figdir = cfg["paths"]["results_dir"], cfg["paths"]["figures_dir"]
+    tag = cfg.get("usa_tag", "")
+    P = f"{tag}_" if tag else ""                          # results prefix, e.g. "nldas_"
+    group = f"{tag.upper()}_USA_states" if tag else GROUP  # PDF group, e.g. NLDAS_USA_states
 
     regions = gpd.read_file(cfg["paths"]["regions_gpkg"])
     us = regions[(regions["country"] == "United States of America") &
@@ -110,7 +113,7 @@ def main() -> None:
     cfg["demand"]["monthly_csv"] = str(monthly_csv)
 
     # storage-optimal solar share + real consumption per state, from the summary
-    summary = pd.read_csv(results_dir / "usa_summary.csv")
+    summary = pd.read_csv(results_dir / f"{P}usa_summary.csv")
     alpha_by_id = dict(zip(summary["region_id"].astype(int), summary["mix_alpha"]))
     cons_by_id = dict(zip(summary["region_id"].astype(int),
                           summary["annual_consumption_TWh"]))
@@ -168,10 +171,10 @@ def main() -> None:
     for src in ("solar", "wind", "mix"):
         # each resource's _normalized plot gets the unconstrained + per-cap supply lines,
         # scaled by that resource's own demand-meeting land footprint.
-        figures.deficit_pdf_realunits(figdir / f"deficit_{src}_{GROUP}.pdf",
-                                      items[src], src, GROUP, spy, land_pct=landpct[src])
+        figures.deficit_pdf_realunits(figdir / f"deficit_{src}_{group}.pdf",
+                                      items[src], src, group, spy, land_pct=landpct[src])
         log.info("wrote deficit_%s_%s_{supply,storage,normalized}.pdf (%d states)",
-                 src, GROUP, len(items[src]))
+                 src, group, len(items[src]))
 
     # ---- months-unmet table (real units) ----
     cols = ["name", "mix_alpha", "annual_consumption_TWh", "feasible_1pct",
@@ -181,7 +184,7 @@ def main() -> None:
            .sort_values("mix_months_unmet", ascending=False)
            .reset_index(drop=True))
     out.insert(0, "rank", out.index + 1)
-    csv_path = results_dir / "usa_months_unmet.csv"
+    csv_path = results_dir / f"{P}usa_months_unmet.csv"
     out.to_csv(csv_path, index=False)
     log.info("wrote %s (%d states)", csv_path, len(out))
 

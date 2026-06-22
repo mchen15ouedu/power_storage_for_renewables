@@ -162,7 +162,8 @@ def main() -> None:
                  rec.get("land_pct_best_today") or -1, rec.get("land_pct_best_2030hi") or -1)
 
     out = pd.DataFrame(rows).sort_values("name")
-    dest = Path(cfg["paths"]["results_dir"]) / "usa_pixel_siting.csv"
+    P = f"{cfg['usa_tag']}_" if cfg.get("usa_tag") else ""    # e.g. "nldas_"
+    dest = Path(cfg["paths"]["results_dir"]) / f"{P}usa_pixel_siting.csv"
     dest.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(dest, index=False)
     log.info("wrote %s (%d states, years %s-%s)", dest, len(out), years[0], years[-1])
